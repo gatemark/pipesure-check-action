@@ -1,0 +1,12 @@
+Gatemark Pipesure Check Licence, version 0.1 (DRAFT, not solicitor-reviewed)
+
+© Gatemark Systems Limited 2026. All rights reserved.
+
+This repository holds the GitHub Action definition for Pipesure Check. The Action, the Pipesure Check binary it
+downloads and the reports it produces are licensed to the person or organisation that holds a valid Pipesure
+licence key or unexpired prepaid credits for the repository owner it is run against, under the Gatemark Pipesure
+Check Licence v0.1 as published with the Software. A licence covers the repository owner it names and nothing else.
+No other right is granted: you may not redistribute the binary, remove or alter its download stamp, or use the
+Software for anyone other than the Licensee. Nothing here is a certification or legal advice.
+
+The full licence text is supplied with the Software and at https://gatemark.net/pipesure/.

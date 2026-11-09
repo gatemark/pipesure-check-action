@@ -1,0 +1,173 @@
+# © Gatemark Systems Limited 2026. All rights reserved. Licensed under the Gatemark Pipesure Check Licence v0.1.
+# The public Action: it downloads the pinned Pipesure Check release from the shop with your licence,
+# verifies the shop's signed manifest against the key pinned below, checks the file's SHA-256 against
+# that manifest, then runs the check. No source and no binary live in this repository.
+name: Pipesure Check
+description: >-
+  Pipeline assurance for GitHub Actions: what was checked, with evidence.
+  Read-only; nothing leaves the runner. Needs a licence from shop.gatemark.net.
+author: Gatemark Systems Limited
+branding:
+  icon: check-square
+  color: green
+
+inputs:
+  licence:
+    description: >-
+      Required. The licence from the shop (ps1.…), from a repository secret:
+      `licence: ${{ secrets.PIPESURE_LICENCE }}`. Buy credits at
+      https://shop.gatemark.net, redeem them for a licence (POST /v1/redeem),
+      store it as a secret. It downloads the binary and is recorded in the report.
+    required: true
+  token:
+    description: >-
+      Token for the read-only GitHub API calls (repository, default branch, its
+      rules). The job should grant `contents: read` and `actions: read` only.
+    default: ${{ github.token }}
+  path:
+    description: The repository checkout to read.
+    default: .
+  output:
+    description: Directory for report.json, report.html, report.sarif and summary.md.
+    default: pipesure-report
+  fail-on:
+    description: >-
+      Opt-in. Set to `did-not-hold` to fail the step when any check did not
+      hold. By default the step only reports. Blocked and Not applicable never fail
+      the step.
+    default: ""
+
+outputs:
+  report:
+    description: Path to report.json.
+    value: ${{ steps.run.outputs.report }}
+  download:
+    description: The download id the shop stamped into the binary (its fingerprint).
+    value: ${{ steps.install.outputs.download }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Pipesure (from the shop, manifest verified)
+      id: install
+      shell: bash
+      env:
+        PIPESURE_LICENCE: ${{ inputs.licence }}
+        PIPESURE_TMP: ${{ runner.temp }}
+        # Pinned at each release: the shop, the version and the shop's manifest
+        # signing key (https://shop.gatemark.net/.well-known/pipesure-licence-key.json).
+        # A key of "unpinned" refuses before anything is downloaded.
+        PIPESURE_SHOP: https://shop.gatemark.net
+        PIPESURE_VERSION: v0.4.0
+        PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
+      # The body is scripts/install-pipesure.sh of the pipesure-check repository, verbatim.
+      run: |
+        set -euo pipefail
+        case "$(uname -s)-$(uname -m)" in
+          Linux-x86_64) target=x86_64-unknown-linux-musl ;;
+          Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-musl ;;
+          Darwin-arm64) target=aarch64-apple-darwin ;;
+          *) echo "pipesure: no binary for $(uname -s) $(uname -m) (Linux x86_64 or arm64, macOS arm64; Windows x64 uses the PowerShell step)" >&2; exit 2 ;;
+        esac
+        if [ -z "${PIPESURE_LICENCE:-}" ]; then
+          echo "pipesure: a licence is required: buy credits at $PIPESURE_SHOP, redeem them for a licence (POST /v1/redeem), store it as the secret PIPESURE_LICENCE and pass it to this step" >&2
+          exit 2
+        fi
+        if [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
+          echo "pipesure: no key is pinned in this version of the install step, so a download cannot be verified; use a released version" >&2
+          exit 2
+        fi
+        case "$PIPESURE_SHOP" in https://*) ;; *) echo "pipesure: the shop address must be https" >&2; exit 2 ;; esac
+        tmp="$PIPESURE_TMP/pipesure-dl"
+        mkdir -p "$tmp"
+        bin="$tmp/pipesure"
+        rm -f "$bin"
+        # The licence reaches curl through its configuration on stdin: it is never an argument.
+        code="$(printf 'header = "Authorization: Bearer %s"\n' "$PIPESURE_LICENCE" | curl --silent --show-error --max-time 120 --config - --dump-header "$tmp/headers.txt" --output "$bin" --write-out '%{http_code}' "$PIPESURE_SHOP/v1/dl/pipesure-check/$PIPESURE_VERSION/$target")"
+        if [ "$code" = 000 ] || [ ! -f "$bin" ]; then
+          echo "pipesure: could not reach the shop at $PIPESURE_SHOP (curl exit above)" >&2
+          exit 2
+        fi
+        if [ "$code" != 200 ]; then
+          echo "pipesure: the shop refused the download (HTTP $code): $(tr -d '\r\n' < "$bin" | head -c 400)" >&2
+          exit 2
+        fi
+        header() { { tr -d '\r' < "$tmp/headers.txt" | grep -i "^$1:" || true; } | tail -n 1 | sed 's/^[^:]*:[[:space:]]*//'; }
+        m64="$(header X-Pipesure-Manifest)"
+        sig="$(header X-Pipesure-Manifest-Sig)"
+        if [ -z "$m64" ] || [ -z "$sig" ]; then echo "pipesure: the shop sent no signed manifest" >&2; exit 2; fi
+        b64url() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac; printf '%s' "$s" | base64 -d; }
+        # The pinned raw key as a DER SubjectPublicKeyInfo: the fixed Ed25519 prefix, then the 32 bytes.
+        { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; b64url "$PIPESURE_PUBLIC_KEY"; } > "$tmp/key.der"
+        openssl pkey -pubin -inform DER -in "$tmp/key.der" -out "$tmp/key.pem"
+        b64url "$sig" > "$tmp/manifest.sig"
+        printf 'psm1.%s' "$m64" > "$tmp/manifest.msg"
+        # openssl's own errors (no Ed25519 or -rawin support: LibreSSL on macOS, an old build) are shown as
+        # such, apart from a signature that does not verify.
+        if ! verdict="$(openssl pkeyutl -verify -pubin -inkey "$tmp/key.pem" -rawin -in "$tmp/manifest.msg" -sigfile "$tmp/manifest.sig" 2>"$tmp/openssl.err")"; then
+          if [ -s "$tmp/openssl.err" ] && ! grep -qi "verification failure" "$tmp/openssl.err"; then
+            echo "pipesure: openssl could not verify the manifest (OpenSSL 1.1.1 or later with Ed25519 is needed; on macOS use Homebrew's openssl@3): $(tr -d '\n' < "$tmp/openssl.err" | head -c 300)" >&2
+            exit 2
+          fi
+          echo "pipesure: the manifest signature does not verify against the pinned key; the file is not run" >&2
+          exit 1
+        fi
+        case "$verdict" in *"Verified Successfully"*) ;; *) echo "pipesure: openssl gave no verdict on the manifest signature; the file is not run" >&2; exit 1 ;; esac
+        b64url "$m64" > "$tmp/manifest.json"
+        field() { tr -d '\n' < "$tmp/manifest.json" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
+        sha="$(field sha256)"; version="$(field version)"; mtarget="$(field target)"; download="$(field download)"
+        if [ "$version" != "$PIPESURE_VERSION" ] || [ "$mtarget" != "$target" ]; then
+          echo "pipesure: the manifest is for $version $mtarget, not $PIPESURE_VERSION $target; the file is not run" >&2
+          exit 1
+        fi
+        case "$sha" in *[!0-9a-f]*|"") echo "pipesure: the manifest carries no digest" >&2; exit 1 ;; esac
+        if command -v sha256sum >/dev/null; then
+          echo "$sha  $bin" | sha256sum --check --strict --quiet
+        else
+          actual="$(shasum -a 256 "$bin" | cut -d ' ' -f 1)"
+          if [ "$actual" != "$sha" ]; then echo "pipesure: the file does not match the manifest's SHA-256" >&2; exit 1; fi
+        fi
+        case "$download" in *[!A-Za-z0-9_-]*|"") download=unknown ;; esac
+        chmod +x "$bin"
+        echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
+        if [ -n "${GITHUB_ENV:-}" ]; then
+          printf 'PIPESURE=%s\nPIPESURE_DOWNLOAD=%s\n' "$bin" "$download" >> "$GITHUB_ENV"
+        else
+          echo "##vso[task.setvariable variable=PIPESURE]$bin"
+          echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
+        fi
+        echo "download=$download" >> "$GITHUB_OUTPUT"
+
+    - name: Read repository settings (read-only GitHub API)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        OUT: ${{ inputs.output }}
+        ROOT: ${{ inputs.path }}
+      run: |
+        set -uo pipefail
+        mkdir -p "$OUT/api"
+        # The files checked in at the scanned commit, for PH-16's proof. No list, no proof.
+        git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
+        # One GET per answer, no retries. A failed call leaves no file, so the
+        # checks that need it report Blocked with the reason.
+        api() { curl --silent --show-error --max-time 30 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$OUT/api/$1" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2" || rm -f "$OUT/api/$1"; }
+        api repo.json ""
+        if branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")"; then
+          api branch.json "/branches/$branch"
+          api rules.json "/rules/branches/$branch"
+        fi
+
+    - name: Run Pipesure Check
+      id: run
+      shell: bash
+      env:
+        ROOT: ${{ inputs.path }}
+        OUT: ${{ inputs.output }}
+        FAIL_ON: ${{ inputs.fail-on }}
+        # Read by the binary and recorded in the report ("Licensed to <owner> until <date>").
+        PIPESURE_LICENCE: ${{ inputs.licence }}
+      run: |
+        set -euo pipefail
+        echo "report=$OUT/report.json" >> "$GITHUB_OUTPUT"
+        "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON"
