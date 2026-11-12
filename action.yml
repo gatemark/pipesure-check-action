@@ -194,8 +194,27 @@ runs:
               ;;
           esac
         }
+        urlencode() {
+          local LC_ALL=C s="$1" i c hex
+          for (( i = 0; i < ${#s}; i++ )); do
+            c="${s:i:1}"
+            case "$c" in
+              [A-Za-z0-9._~-]) printf '%s' "$c" ;;
+              *) printf -v hex '%%%02X' "'$c"; printf '%s' "$hex" ;;
+            esac
+          done
+        }
+        is_percent_encoded() {
+          local LC_ALL=C
+          [[ "$1" =~ ^([A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$ ]]
+        }
         api repo.json ""
-        if [ -f "$OUT/api/repo.json" ] && branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")"; then
+        if [ -f "$OUT/api/repo.json" ] && branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")" && [ -n "$branch" ]; then
+          if command -v jq >/dev/null 2>&1 && raw_branch="$(jq -er '.default_branch | strings' "$OUT/api/repo.json" 2>/dev/null)"; then
+            branch="$(urlencode "$raw_branch")"
+          elif ! is_percent_encoded "$branch"; then
+            branch="$(urlencode "$branch")"
+          fi
           api branch.json "/branches/$branch"
           api rules.json "/rules/branches/$branch"
         fi

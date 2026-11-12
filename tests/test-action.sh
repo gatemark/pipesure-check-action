@@ -599,6 +599,66 @@ GITHUB_REPOSITORY="octo/slow" \
 bash "$WORK/step-1.sh" 2>/dev/null
 assert_eq "$( [ ! -e "$OUT_002_BAD/api/repo.json" ] && [ "$(wc -l < "$INJ_LOG" | tr -d ' ')" = "0" ] && echo yes || echo no )" "yes" "002: malformed GH_TOKEN with quote/newline cannot inject curl directives"
 
+# --- 004 Regression: default branch with '#', '?', '%', '/' or space is percent-encoded without double-encoding ---
+API_BRANCH_ROUTES="$WORK/api-branch-routes.json"
+cat > "$API_BRANCH_ROUTES" <<'EOF'
+{
+  "/repos/octo/weird-branch": {
+    "status": 200,
+    "body": "{\"default_branch\":\"release/v1#rc?x=1 100%\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/weird-branch/branches/release%2Fv1%23rc%3Fx%3D1%20100%25": {
+    "status": 200,
+    "body": "{\"protected\":true}"
+  },
+  "/repos/octo/weird-branch/rules/branches/release%2Fv1%23rc%3Fx%3D1%20100%25": {
+    "status": 200,
+    "body": "[{\"type\":\"pull_request\"}]"
+  }
+}
+EOF
+start_server "$API_BRANCH_ROUTES" no
+API_BRANCH_PORT="$STARTED_PORT"
+API_BRANCH_LOG="$STARTED_LOG"
+
+OUT_004_RAW="$WORK/out-004-raw"
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="tok_test004" \
+OUT="$OUT_004_RAW" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_BRANCH_PORT}" \
+GITHUB_REPOSITORY="octo/weird-branch" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$OUT_004_RAW/api/branch.json" ] && [ -f "$OUT_004_RAW/api/rules.json" ] && echo yes || echo no )" "yes" "004: raw default-branch with #, ?, %, /, space is percent-encoded and saves branch.json + rules.json"
+assert_eq "$(grep -c 'release%2Fv1%23rc%3Fx%3D1%20100%25' "$API_BRANCH_LOG" || true)" "2" "004: mock API received exact percent-encoded branch and rules URIs"
+
+# Pre-encoded binary stub (matches real pipesure binary behaviour) must not be double-encoded.
+PREENC_BIN="$WORK/preenc-pipesure-bin"
+cat > "$PREENC_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "default-branch" ]; then
+  python3 -c '
+import json, sys, urllib.parse
+d = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+print(urllib.parse.quote(d["default_branch"], safe="-._~"))
+' "$2"
+  exit 0
+fi
+exit 2
+EOF
+chmod +x "$PREENC_BIN"
+
+OUT_004_PRE="$WORK/out-004-pre"
+PIPESURE="$PREENC_BIN" \
+GH_TOKEN="tok_test004" \
+OUT="$OUT_004_PRE" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_BRANCH_PORT}" \
+GITHUB_REPOSITORY="octo/weird-branch" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$OUT_004_PRE/api/branch.json" ] && [ -f "$OUT_004_PRE/api/rules.json" ] && echo yes || echo no )" "yes" "004: pre-encoded default-branch output is not double-encoded"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
