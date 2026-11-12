@@ -158,10 +158,20 @@ runs:
         git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
         # One GET per answer, no retries. A failed or non-2xx call leaves no settings
         # file (recording the HTTP status in *.error), so checks report Blocked.
+        valid_gh_token() { local LC_ALL=C; case "$1" in *[[:cntrl:][:space:]\"\\]*) return 1 ;; esac; }
         api() {
           local dst="$OUT/api/$1" tmp="$OUT/api/$1.tmp" code err
           rm -f "$dst" "$tmp" "$dst.error"
-          code="$(curl --silent --show-error --fail-with-body --max-time 30 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          if ! valid_gh_token "${GH_TOKEN:-}"; then
+            printf 'invalid GitHub token format\n' > "$dst.error"
+            echo "pipesure: GitHub API $1 skipped (invalid token format)" >&2
+            return 0
+          fi
+          if [ -n "${GH_TOKEN:-}" ]; then
+            code="$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" | curl --silent --show-error --fail-with-body --max-time 30 --config - --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          else
+            code="$(curl --silent --show-error --fail-with-body --max-time 30 --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          fi
           case "$code" in
             2??)
               if [ -f "$tmp" ]; then

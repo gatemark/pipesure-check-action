@@ -529,6 +529,76 @@ ok = len(blocks) >= 2 and all("[!A-Za-z0-9._-]" in b for b in blocks if "--confi
 print("yes" if ok else "no")
 ' "$ROOT_DIR/README.md")" "yes" "005: README curl --config examples validate key/licence format"
 
+# --- 002 Regression: GH_TOKEN passed via curl --config stdin, never in curl argv (/proc/*/cmdline) ---
+API_SLOW_ROUTES="$WORK/api-slow-routes.json"
+cat > "$API_SLOW_ROUTES" <<'EOF'
+{
+  "/repos/octo/slow": {
+    "status": 200,
+    "delay_ms": 400,
+    "body": "{\"default_branch\":\"main\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/slow/branches/main": {"status": 200, "body": "{\"protected\":true}"},
+  "/repos/octo/slow/rules/branches/main": {"status": 200, "body": "[]"}
+}
+EOF
+start_server "$API_SLOW_ROUTES" no
+API_SLOW_PORT="$STARTED_PORT"
+API_SLOW_LOG="$STARTED_LOG"
+
+SENTINEL_GH_TOKEN="tok_cmdline_002"
+CMDLINE_LEAK_FILE="$WORK/cmdline-leak-002"
+python3 -c '
+import glob, os, sys, time
+sentinel = sys.argv[1].encode("utf-8")
+out_path = sys.argv[2]
+uid = os.getuid()
+deadline = time.monotonic() + 2.5
+leaked = False
+while time.monotonic() < deadline and not leaked:
+    for p in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            st = os.stat(p)
+            if st.st_uid != uid:
+                continue
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        parts = data.split(b"\x00")
+        exe = os.path.basename(parts[0]) if parts else b""
+        if exe == b"curl" and sentinel in data:
+            leaked = True
+            break
+    time.sleep(0.02)
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("leaked\n" if leaked else "clean\n")
+' "$SENTINEL_GH_TOKEN" "$CMDLINE_LEAK_FILE" &
+SAMPLER_PID=$!
+
+OUT_002="$WORK/out-002"
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="$SENTINEL_GH_TOKEN" \
+OUT="$OUT_002" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_SLOW_PORT}" \
+GITHUB_REPOSITORY="octo/slow" \
+bash "$WORK/step-1.sh" 2>/dev/null
+
+wait "$SAMPLER_PID" || true
+assert_eq "$(tr -d '\r\n' < "$CMDLINE_LEAK_FILE")" "clean" "002: GH_TOKEN never appears in curl /proc/*/cmdline argv"
+assert_eq "$( [ -f "$OUT_002/api/repo.json" ] && grep -q "\"authorization\": \"Bearer $SENTINEL_GH_TOKEN\"" "$API_SLOW_LOG" && echo yes || echo no )" "yes" "002: API call still authenticates via stdin curl --config and saves repo.json"
+
+OUT_002_BAD="$WORK/out-002-bad"
+INJ_GH_TOKEN="$(printf 'tok_bad"\nurl = "http://127.0.0.1:%s/injected"' "$INJ_PORT")"
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="$INJ_GH_TOKEN" \
+OUT="$OUT_002_BAD" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_SLOW_PORT}" \
+GITHUB_REPOSITORY="octo/slow" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ ! -e "$OUT_002_BAD/api/repo.json" ] && [ "$(wc -l < "$INJ_LOG" | tr -d ' ')" = "0" ] && echo yes || echo no )" "yes" "002: malformed GH_TOKEN with quote/newline cannot inject curl directives"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1
