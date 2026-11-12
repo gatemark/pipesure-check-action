@@ -719,6 +719,100 @@ assert_eq "$RC_006_STEP1" "2" "006: multi-line inputs.output rejected in setting
 assert_eq "$RC_006_TMP" "2" "006: multi-line PIPESURE_TMP rejected in install step with exit 2"
 assert_eq "$(wc -l < "$GH_OUT_006_BAD" | tr -d ' ')" "0" "006: rejected multi-line inputs leave GITHUB_OUTPUT untouched"
 
+# --- 007 Regression: signed manifest parsed with strict JSON parser (accepts whitespace, rejects duplicate keys) ---
+SPACED_MANIFEST="$(printf '{\n  "version": "v0.4.0",\n  "target": "%s",\n  "sha256": "%s",\n  "download": "dl_spaced007"\n}' "$HOST_TARGET" "$PAYLOAD_SHA")"
+{
+  IFS= read -r SPACED_M64
+  IFS= read -r SPACED_SIG
+} < <(sign_manifest "$SPACED_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+DUP_SHA_MANIFEST="{\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_dupsha\"}"
+{
+  IFS= read -r DUP_SHA_M64
+  IFS= read -r DUP_SHA_SIG
+} < <(sign_manifest "$DUP_SHA_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+DUP_VER_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.0.1\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_dupver\"}"
+{
+  IFS= read -r DUP_VER_M64
+  IFS= read -r DUP_VER_SIG
+} < <(sign_manifest "$DUP_VER_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+MALFORMED_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_broken\""
+{
+  IFS= read -r MALFORMED_M64
+  IFS= read -r MALFORMED_SIG
+} < <(sign_manifest "$MALFORMED_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+SHOP_007_ROUTES="$WORK/shop-007-routes.json"
+python3 -c '
+import json, sys
+p_bin, t = sys.argv[1], sys.argv[2]
+(spm, sps, dsm, dss, dvm, dvs, mm, ms) = sys.argv[3:11]
+routes = {
+    f"/spaced/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": spm, "X-Pipesure-Manifest-Sig": sps}
+    },
+    f"/dup-sha/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dsm, "X-Pipesure-Manifest-Sig": dss}
+    },
+    f"/dup-ver/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dvm, "X-Pipesure-Manifest-Sig": dvs}
+    },
+    f"/malformed/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": mm, "X-Pipesure-Manifest-Sig": ms}
+    },
+}
+with open(sys.argv[11], "w", encoding="utf-8") as f:
+    json.dump(routes, f)
+' "$PAYLOAD_BIN" "$HOST_TARGET" \
+  "$SPACED_M64" "$SPACED_SIG" \
+  "$DUP_SHA_M64" "$DUP_SHA_SIG" \
+  "$DUP_VER_M64" "$DUP_VER_SIG" \
+  "$MALFORMED_M64" "$MALFORMED_SIG" \
+  "$SHOP_007_ROUTES"
+
+start_server "$SHOP_007_ROUTES" tls
+SHOP_007_PORT="$STARTED_PORT"
+
+run_install_007() {
+  local subpath="$1"
+  local cdir
+  cdir="$(mktemp -d "$WORK/c007.XXXXXX")"
+  : > "$cdir/gh_env"
+  : > "$cdir/gh_out"
+  set +e
+  CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  PIPESURE_TMP="$cdir/tmp" \
+  PIPESURE_SHOP="https://127.0.0.1:${SHOP_007_PORT}${subpath}" \
+  PIPESURE_VERSION="v0.4.0" \
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  GITHUB_ENV="$cdir/gh_env" \
+  GITHUB_OUTPUT="$cdir/gh_out" \
+  bash "$WORK/step-0.sh" >"$cdir/stdout" 2>"$cdir/stderr"
+  RC_007=$?
+  set -e
+  CDIR_007="$cdir"
+}
+
+run_install_007 "/spaced"
+assert_eq "$RC_007" "0" "007: signed manifest with whitespace after colons succeeds"
+assert_eq "$(grep -q 'dl_spaced007' "$CDIR_007/gh_out" && echo yes || echo no)" "yes" "007: spaced manifest parses download id cleanly"
+
+run_install_007 "/dup-sha"
+assert_eq "$RC_007" "1" "007: duplicate sha256 keys in signed manifest rejected with exit 1"
+
+run_install_007 "/dup-ver"
+assert_eq "$RC_007" "1" "007: duplicate version keys in signed manifest rejected with exit 1"
+
+run_install_007 "/malformed"
+assert_eq "$RC_007" "1" "007: malformed JSON manifest rejected with exit 1"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

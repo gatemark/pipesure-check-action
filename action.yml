@@ -124,8 +124,46 @@ runs:
         fi
         case "$verdict" in *"Verified Successfully"*) ;; *) echo "pipesure: openssl gave no verdict on the manifest signature; the file is not run" >&2; exit 1 ;; esac
         b64url "$m64" > "$tmp/manifest.json"
-        field() { tr -d '\n' < "$tmp/manifest.json" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
-        sha="$(field sha256)"; version="$(field version)"; mtarget="$(field target)"; download="$(field download)"
+        if ! python3 -c '
+        import json, sys
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("duplicate key: " + k)
+                d[k] = v
+            return d
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            obj = json.load(f, object_pairs_hook=no_dups)
+        if not isinstance(obj, dict):
+            raise ValueError("manifest must be a JSON object")
+        out = []
+        for k in ("sha256", "version", "target"):
+            v = obj.get(k)
+            if not isinstance(v, str):
+                raise ValueError("missing string field: " + k)
+            out.append(v)
+        dl = obj.get("download", "")
+        if dl is None:
+            dl = ""
+        if not isinstance(dl, str):
+            raise ValueError("download must be a string")
+        out.append(dl)
+        for v in out:
+            if "\n" in v or "\r" in v or "\x00" in v:
+                raise ValueError("control character in manifest field")
+        with open(sys.argv[2], "w", encoding="utf-8") as out_f:
+            out_f.write("\n".join(out) + "\n")
+        ' "$tmp/manifest.json" "$tmp/manifest.fields" 2>/dev/null; then
+          echo "pipesure: the signed manifest is not valid JSON; the file is not run" >&2
+          exit 1
+        fi
+        {
+          IFS= read -r sha
+          IFS= read -r version
+          IFS= read -r mtarget
+          IFS= read -r download
+        } < "$tmp/manifest.fields"
         if [ "$version" != "$PIPESURE_VERSION" ] || [ "$mtarget" != "$target" ]; then
           echo "pipesure: the manifest is for $version $mtarget, not $PIPESURE_VERSION $target; the file is not run" >&2
           exit 1
