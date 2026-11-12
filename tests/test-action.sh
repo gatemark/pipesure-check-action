@@ -434,6 +434,64 @@ else
   pass "001: parity check fails closed on any 1-line difference"
 fi
 
+# --- 003 Regression: GitHub API non-2xx responses leave no settings file and record *.error ---
+API_ERR_ROUTES="$WORK/api-err-routes.json"
+cat > "$API_ERR_ROUTES" <<'EOF'
+{
+  "/repos/octo/forbidden": {
+    "status": 403,
+    "body": "{\"message\":\"Resource not accessible by integration\"}"
+  },
+  "/repos/octo/partial": {
+    "status": 200,
+    "body": "{\"default_branch\":\"main\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/partial/branches/main": {
+    "status": 404,
+    "body": "{\"message\":\"Branch not found\"}"
+  },
+  "/repos/octo/partial/rules/branches/main": {
+    "status": 500,
+    "body": "Internal Server Error"
+  }
+}
+EOF
+start_server "$API_ERR_ROUTES" no
+API_ERR_PORT="$STARTED_PORT"
+
+ERR_OUT_403="$WORK/out-003-403"
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="tok_test003" \
+OUT="$ERR_OUT_403" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_ERR_PORT}" \
+GITHUB_REPOSITORY="octo/forbidden" \
+bash "$WORK/step-1.sh" 2>"$WORK/step1-003.err"
+
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$ERR_OUT_403" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$WORK/gh_out_003" \
+bash "$WORK/step-2.sh"
+assert_eq "$( [ -e "$ERR_OUT_403/api/repo.json" ] && echo yes || echo no )" "no" "003: HTTP 403 leaves no repo.json"
+assert_eq "$( [ -f "$ERR_OUT_403/api/repo.json.error" ] && grep -q 'HTTP 403' "$ERR_OUT_403/api/repo.json.error" && echo yes || echo no )" "yes" "003: HTTP 403 writes repo.json.error with HTTP status"
+assert_eq "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("yes" if r["verdict"]=="Blocked" and "HTTP 403" in r["reason"] else "no")' "$ERR_OUT_403/report.json")" "yes" "003: HTTP 403 produces Blocked verdict with HTTP 403 in reason"
+
+ERR_OUT_PARTIAL="$WORK/out-003-partial"
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="tok_test003" \
+OUT="$ERR_OUT_PARTIAL" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_ERR_PORT}" \
+GITHUB_REPOSITORY="octo/partial" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$ERR_OUT_PARTIAL/api/repo.json" ] && echo yes || echo no )" "yes" "003: HTTP 200 repo.json is saved"
+assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/branch.json" ] && echo yes || echo no )" "no" "003: HTTP 404 leaves no branch.json"
+assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/rules.json" ] && echo yes || echo no )" "no" "003: HTTP 500 leaves no rules.json"
+assert_eq "$( [ -f "$ERR_OUT_PARTIAL/api/branch.json.error" ] && grep -q 'HTTP 404' "$ERR_OUT_PARTIAL/api/branch.json.error" && [ -f "$ERR_OUT_PARTIAL/api/rules.json.error" ] && grep -q 'HTTP 500' "$ERR_OUT_PARTIAL/api/rules.json.error" && echo yes || echo no )" "yes" "003: HTTP 404/500 write branch.json.error and rules.json.error"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

@@ -151,11 +151,36 @@ runs:
         mkdir -p "$OUT/api"
         # The files checked in at the scanned commit, for PH-16's proof. No list, no proof.
         git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
-        # One GET per answer, no retries. A failed call leaves no file, so the
-        # checks that need it report Blocked with the reason.
-        api() { curl --silent --show-error --max-time 30 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$OUT/api/$1" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2" || rm -f "$OUT/api/$1"; }
+        # One GET per answer, no retries. A failed or non-2xx call leaves no settings
+        # file (recording the HTTP status in *.error), so checks report Blocked.
+        api() {
+          local dst="$OUT/api/$1" tmp="$OUT/api/$1.tmp" code err
+          rm -f "$dst" "$tmp" "$dst.error"
+          code="$(curl --silent --show-error --fail-with-body --max-time 30 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          case "$code" in
+            2??)
+              if [ -f "$tmp" ]; then
+                mv -f "$tmp" "$dst"
+              fi
+              ;;
+            *)
+              err=""
+              if [ -f "$tmp" ]; then
+                err="$(tr -d '\r\n' < "$tmp" | head -c 400)"
+                if [ -n "${GH_TOKEN:-}" ]; then err="${err//"$GH_TOKEN"/[REDACTED]}"; fi
+              fi
+              rm -f "$tmp" "$dst"
+              if [ -n "$err" ]; then
+                printf 'HTTP %s: %s\n' "${code:-000}" "$err" > "$dst.error"
+              else
+                printf 'HTTP %s\n' "${code:-000}" > "$dst.error"
+              fi
+              echo "pipesure: GitHub API $1 failed (HTTP ${code:-000})" >&2
+              ;;
+          esac
+        }
         api repo.json ""
-        if branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")"; then
+        if [ -f "$OUT/api/repo.json" ] && branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")"; then
           api branch.json "/branches/$branch"
           api rules.json "/rules/branches/$branch"
         fi
