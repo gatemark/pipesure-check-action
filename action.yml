@@ -60,7 +60,7 @@ runs:
         PIPESURE_SHOP: https://shop.gatemark.net
         PIPESURE_VERSION: v0.4.0
         PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
-      # The body is scripts/install-pipesure.sh of the pipesure-check repository, verbatim.
+      # The body is scripts/install-pipesure.sh in this repository, verbatim (checked by scripts/check-parity.sh).
       run: |
         set -euo pipefail
         case "$(uname -s)-$(uname -m)" in
@@ -136,7 +136,9 @@ runs:
           echo "##vso[task.setvariable variable=PIPESURE]$bin"
           echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
         fi
-        echo "download=$download" >> "$GITHUB_OUTPUT"
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          echo "download=$download" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Read repository settings (read-only GitHub API)
       shell: bash
