@@ -1,0 +1,1086 @@
+#!/usr/bin/env bash
+# © Gatemark Systems Limited 2026. All rights reserved. Licensed under the Gatemark Pipesure Check Licence v0.1.
+# Automated test harness for pipesure-check-action: local TLS mock shop, Ed25519 manifest signing,
+# composite step execution, and parity drift detection.
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/pipesure-action-test.XXXXXX")"
+SERVER_PIDS=()
+
+cleanup() {
+  local pid
+  for pid in "${SERVER_PIDS[@]:-}"; do
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+PASS=0
+FAIL=0
+
+pass() {
+  PASS=$((PASS + 1))
+  printf 'PASS: %s\n' "$1"
+}
+
+fail() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL: %s\n' "$1" >&2
+}
+
+assert_eq() {
+  local got="$1" want="$2" msg="$3"
+  if [ "$got" = "$want" ]; then
+    pass "$msg"
+  else
+    fail "$msg (got '$got', want '$want')"
+  fi
+}
+
+# Extract the three composite step scripts from action.yml.
+python3 -c '
+import os, sys, yaml
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    doc = yaml.safe_load(f)
+out_dir = sys.argv[2]
+for idx, step in enumerate(doc["runs"]["steps"]):
+    p = os.path.join(out_dir, f"step-{idx}.sh")
+    with open(p, "w", encoding="utf-8") as out:
+        out.write("#!/usr/bin/env bash\n")
+        out.write(step["run"])
+        if not step["run"].endswith("\n"):
+            out.write("\n")
+    os.chmod(p, 0o700)
+' "$ROOT_DIR/action.yml" "$WORK"
+
+# Determine current host target matching action.yml.
+case "$(uname -s)-$(uname -m)" in
+  Linux-x86_64) HOST_TARGET=x86_64-unknown-linux-musl ;;
+  Linux-aarch64|Linux-arm64) HOST_TARGET=aarch64-unknown-linux-musl ;;
+  Darwin-arm64) HOST_TARGET=aarch64-apple-darwin ;;
+  *) echo "unsupported test host $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+
+# Generate ephemeral Ed25519 signing keypair (and a second wrong keypair) + localhost TLS cert.
+KEYS_DIR="$WORK/keys"
+mkdir -p "$KEYS_DIR"
+openssl genpkey -algorithm Ed25519 -out "$KEYS_DIR/shop.key.pem" >/dev/null 2>&1
+openssl genpkey -algorithm Ed25519 -out "$KEYS_DIR/wrong.key.pem" >/dev/null 2>&1
+
+SHOP_PUB_B64URL="$(python3 -c '
+import base64, subprocess, sys
+der = subprocess.check_output(["openssl", "pkey", "-in", sys.argv[1], "-pubout", "-outform", "DER"])
+assert len(der) == 44 and der[:12] == b"\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00"
+print(base64.urlsafe_b64encode(der[12:]).decode("ascii").rstrip("="))
+' "$KEYS_DIR/shop.key.pem")"
+
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout "$KEYS_DIR/tls.key.pem" \
+  -out "$KEYS_DIR/tls.cert.pem" \
+  -days 1 \
+  -subj "/CN=127.0.0.1" \
+  -addext "subjectAltName=IP:127.0.0.1" >/dev/null 2>&1
+
+# Create a benign mock pipesure payload script that records execution to $PIPESURE_EXEC_MARKER.
+PAYLOAD_BIN="$WORK/mock-pipesure-bin"
+cat > "$PAYLOAD_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ -n "${PIPESURE_EXEC_MARKER:-}" ]; then
+  printf 'ran:%s\n' "$*" >> "$PIPESURE_EXEC_MARKER"
+fi
+cmd="${1:-}"
+case "$cmd" in
+  default-branch)
+    file="${2:-}"
+    [ -f "$file" ] || exit 1
+    python3 -c '
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    d = json.load(f)
+if "message" in d or "default_branch" not in d:
+    sys.exit(1)
+print(d["default_branch"])
+' "$file"
+    ;;
+  check)
+    shift
+    out=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --out) out="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    mkdir -p "$out"
+    status="Held"
+    reason="all controls held"
+    if [ ! -f "$out/api/repo.json" ]; then
+      status="Blocked"
+      if [ -f "$out/api/repo.json.error" ]; then
+        reason="$(tr -d '\r\n' < "$out/api/repo.json.error")"
+      else
+        reason="repository answer: no API answer was saved"
+      fi
+    fi
+    python3 -c '
+import json, os, sys
+out, status, reason = sys.argv[1], sys.argv[2], sys.argv[3]
+licence_claim = "Licensed to Example Org until 2026-12-31"
+report = {"verdict": status, "reason": reason, "licence": licence_claim}
+with open(os.path.join(out, "report.json"), "w", encoding="utf-8") as f:
+    json.dump(report, f)
+with open(os.path.join(out, "report.html"), "w", encoding="utf-8") as f:
+    f.write(f"<html><body>{status}: {reason} ({licence_claim})</body></html>\n")
+with open(os.path.join(out, "report.sarif"), "w", encoding="utf-8") as f:
+    json.dump({"version": "2.1.0", "runs": [{"properties": {"licence": licence_claim}}]}, f)
+with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
+    f.write(f"# Pipesure Check\n\n- Verdict: {status}\n- {licence_claim}\n")
+' "$out" "$status" "$reason"
+    ;;
+  *)
+    exit 2
+    ;;
+esac
+EOF
+chmod +x "$PAYLOAD_BIN"
+PAYLOAD_SHA="$(sha256sum "$PAYLOAD_BIN" | cut -d ' ' -f 1)"
+
+sign_manifest() {
+  local manifest_json="$1" key_pem="$2"
+  python3 -c '
+import base64, subprocess, sys, tempfile
+m_bytes = sys.argv[1].encode("utf-8")
+key_pem = sys.argv[2]
+m64 = base64.urlsafe_b64encode(m_bytes).decode("ascii").rstrip("=")
+msg = ("psm1." + m64).encode("ascii")
+with tempfile.NamedTemporaryFile() as mf, tempfile.NamedTemporaryFile() as sf:
+    mf.write(msg)
+    mf.flush()
+    subprocess.check_call([
+        "openssl", "pkeyutl", "-sign", "-inkey", key_pem,
+        "-rawin", "-in", mf.name, "-out", sf.name
+    ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    sig = sf.read()
+sig64 = base64.urlsafe_b64encode(sig).decode("ascii").rstrip("=")
+print(m64)
+print(sig64)
+' "$manifest_json" "$key_pem"
+}
+
+start_server() {
+  local routes_file="$1" tls="${2:-no}"
+  local srv_dir
+  srv_dir="$(mktemp -d "$WORK/srv.XXXXXX")"
+  local port_file="$srv_dir/port"
+  local log_file="$srv_dir/requests.jsonl"
+  : > "$log_file"
+  if [ "$tls" = "tls" ]; then
+    python3 "$ROOT_DIR/tests/mock_servers.py" \
+      --routes "$routes_file" \
+      --port-file "$port_file" \
+      --log-file "$log_file" \
+      --tls-cert "$KEYS_DIR/tls.cert.pem" \
+      --tls-key "$KEYS_DIR/tls.key.pem" &
+  else
+    python3 "$ROOT_DIR/tests/mock_servers.py" \
+      --routes "$routes_file" \
+      --port-file "$port_file" \
+      --log-file "$log_file" &
+  fi
+  local pid=$!
+  SERVER_PIDS+=("$pid")
+  local tries=0
+  while [ ! -s "$port_file" ]; do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      echo "mock server exited before writing port" >&2
+      exit 1
+    fi
+    tries=$((tries + 1))
+    if [ "$tries" -ge 100 ]; then
+      echo "timed out waiting for mock server port" >&2
+      exit 1
+    fi
+    sleep 0.05
+  done
+  STARTED_PORT="$(tr -d '\r\n' < "$port_file")"
+  STARTED_LOG="$log_file"
+}
+
+load_github_env() {
+  local env_file="$1"
+  python3 -c '
+import shlex, sys
+lines = open(sys.argv[1], "r", encoding="utf-8").read().splitlines()
+i = 0
+while i < len(lines):
+    line = lines[i]
+    if "<<" in line:
+        k, delim = line.split("<<", 1)
+        i += 1
+        vals = []
+        while i < len(lines) and lines[i] != delim:
+            vals.append(lines[i])
+            i += 1
+        val = "\n".join(vals)
+        print(f"export {k}={shlex.quote(val)}")
+    elif "=" in line:
+        k, val = line.split("=", 1)
+        print(f"export {k}={shlex.quote(val)}")
+    i += 1
+' "$env_file"
+}
+
+# Build routes for the TLS mock shop covering valid and tampered paths.
+VALID_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_test001\"}"
+{
+  IFS= read -r VALID_M64
+  IFS= read -r VALID_SIG
+} < <(sign_manifest "$VALID_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+{
+  IFS= read -r WRONG_KEY_M64
+  IFS= read -r WRONG_KEY_SIG
+} < <(sign_manifest "$VALID_MANIFEST" "$KEYS_DIR/wrong.key.pem")
+
+WRONG_SHA_MANIFEST="{\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_badsha\"}"
+{
+  IFS= read -r WRONG_SHA_M64
+  IFS= read -r WRONG_SHA_SIG
+} < <(sign_manifest "$WRONG_SHA_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+WRONG_VER_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.3.9\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_badver\"}"
+{
+  IFS= read -r WRONG_VER_M64
+  IFS= read -r WRONG_VER_SIG
+} < <(sign_manifest "$WRONG_VER_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+WRONG_TGT_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"sparc64-unknown-linux-gnu\",\"download\":\"dl_badtgt\"}"
+{
+  IFS= read -r WRONG_TGT_M64
+  IFS= read -r WRONG_TGT_SIG
+} < <(sign_manifest "$WRONG_TGT_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+SHOP_ROUTES="$WORK/shop-routes.json"
+python3 -c '
+import json, sys
+p_bin, t = sys.argv[1], sys.argv[2]
+(vm, vs, wm, ws, sm, ss, verm, vers, tm, ts) = sys.argv[3:13]
+routes = {
+    f"/ok/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": vm, "X-Pipesure-Manifest-Sig": vs}
+    },
+    f"/bad-sig/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": wm, "X-Pipesure-Manifest-Sig": ws}
+    },
+    f"/bad-sha/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": sm, "X-Pipesure-Manifest-Sig": ss}
+    },
+    f"/bad-ver/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": verm, "X-Pipesure-Manifest-Sig": vers}
+    },
+    f"/bad-tgt/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": tm, "X-Pipesure-Manifest-Sig": ts}
+    },
+    f"/no-headers/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin, "headers": {}
+    },
+    f"/refused/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 403, "body": "licence expired", "headers": {}
+    },
+}
+with open(sys.argv[13], "w", encoding="utf-8") as f:
+    json.dump(routes, f)
+' "$PAYLOAD_BIN" "$HOST_TARGET" \
+  "$VALID_M64" "$VALID_SIG" \
+  "$WRONG_KEY_M64" "$WRONG_KEY_SIG" \
+  "$WRONG_SHA_M64" "$WRONG_SHA_SIG" \
+  "$WRONG_VER_M64" "$WRONG_VER_SIG" \
+  "$WRONG_TGT_M64" "$WRONG_TGT_SIG" \
+  "$SHOP_ROUTES"
+
+start_server "$SHOP_ROUTES" tls
+SHOP_PORT="$STARTED_PORT"
+SHOP_LOG="$STARTED_LOG"
+
+run_install_case() {
+  local subpath="$1" licence="$2" pubkey="$3" scheme="${4:-https}"
+  local case_dir
+  case_dir="$(mktemp -d "$WORK/case.XXXXXX")"
+  : > "$case_dir/gh_env"
+  : > "$case_dir/gh_out"
+  set +e
+  CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+  PIPESURE_LICENCE="$licence" \
+  PIPESURE_TMP="$case_dir/tmp" \
+  PIPESURE_SHOP="${scheme}://127.0.0.1:${SHOP_PORT}${subpath}" \
+  PIPESURE_VERSION="v0.4.0" \
+  PIPESURE_PUBLIC_KEY="$pubkey" \
+  PIPESURE_EXEC_MARKER="$case_dir/executed" \
+  GITHUB_ENV="$case_dir/gh_env" \
+  GITHUB_OUTPUT="$case_dir/gh_out" \
+  bash "$WORK/step-0.sh" >"$case_dir/stdout" 2>"$case_dir/stderr"
+  CASE_RC=$?
+  set -e
+  CASE_DIR="$case_dir"
+}
+
+# --- 001 Case 1: valid signed manifest + end-to-end composite steps ---
+run_install_case "/ok" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "0" "001: valid signed manifest exits 0"
+
+API_ROUTES="$WORK/api-ok-routes.json"
+cat > "$API_ROUTES" <<'EOF'
+{
+  "/repos/octo/demo": {"status": 200, "body": "{\"default_branch\":\"main\",\"visibility\":\"private\"}"},
+  "/repos/octo/demo/branches/main": {"status": 200, "body": "{\"protected\":true}"},
+  "/repos/octo/demo/rules/branches/main": {"status": 200, "body": "[]"}
+}
+EOF
+start_server "$API_ROUTES" no
+API_OK_PORT="$STARTED_PORT"
+
+# Create a minimal git checkout for step 1 (`git ls-tree HEAD`).
+SAMPLE_REPO="$WORK/sample-repo"
+mkdir -p "$SAMPLE_REPO"
+git -C "$SAMPLE_REPO" init -q
+git -C "$SAMPLE_REPO" config user.email "test@example.invalid"
+git -C "$SAMPLE_REPO" config user.name "Test"
+echo "hi" > "$SAMPLE_REPO/README.md"
+git -C "$SAMPLE_REPO" add README.md
+git -C "$SAMPLE_REPO" commit -q -m "init"
+
+(
+  eval "$(load_github_env "$CASE_DIR/gh_env")"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  PIPESURE_EXEC_MARKER="$CASE_DIR/executed" \
+  GH_TOKEN="tok_test001" \
+  OUT="$CASE_DIR/report-out" \
+  ROOT="$SAMPLE_REPO" \
+  GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+  GITHUB_REPOSITORY="octo/demo" \
+  bash "$WORK/step-1.sh"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  PIPESURE_EXEC_MARKER="$CASE_DIR/executed" \
+  OUT="$CASE_DIR/report-out" \
+  ROOT="$SAMPLE_REPO" \
+  FAIL_ON="" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  GITHUB_OUTPUT="$CASE_DIR/gh_out_run" \
+  bash "$WORK/step-2.sh"
+)
+if [ -f "$CASE_DIR/report-out/report.json" ] && [ -f "$CASE_DIR/report-out/api/files.txt" ]; then
+  pass "001: composite steps 2 and 3 produce report.json and api/files.txt"
+else
+  fail "001: composite steps 2 and 3 missing expected outputs"
+fi
+
+# --- 001 Negative cases: tampered signature, SHA-256, version, target, missing headers, HTTP, unpinned key, missing licence, shop 403 ---
+run_install_case "/bad-sig" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "1" "001: tampered Ed25519 signature rejected with exit 1"
+assert_eq "$( [ -e "$CASE_DIR/executed" ] && echo yes || echo no )" "no" "001: tampered signature never executes payload"
+
+run_install_case "/bad-sha" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "1" "001: tampered binary SHA-256 rejected with exit 1"
+assert_eq "$( [ -e "$CASE_DIR/executed" ] && echo yes || echo no )" "no" "001: tampered SHA-256 never executes payload"
+
+run_install_case "/bad-ver" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "1" "001: wrong manifest version rejected with exit 1"
+
+run_install_case "/bad-tgt" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "1" "001: wrong manifest target rejected with exit 1"
+
+run_install_case "/no-headers" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "001: missing manifest headers rejected with exit 2"
+
+run_install_case "/ok" "ps1.test_lic" "$SHOP_PUB_B64URL" "http"
+assert_eq "$CASE_RC" "2" "001: plain-HTTP shop URL rejected with exit 2"
+if grep -q '"authorization": "Bearer ps1.test_lic"' "$SHOP_LOG"; then
+  pass "001: mock TLS shop received Bearer licence header on valid download"
+else
+  fail "001: mock TLS shop log missing expected Bearer licence header"
+fi
+
+run_install_case "/ok" "ps1.test_lic" "unpinned"
+assert_eq "$CASE_RC" "2" "001: unpinned key rejected with exit 2"
+
+run_install_case "/ok" "ps1.test_lic" "shortkey"
+assert_eq "$CASE_RC" "2" "001: wrong-length key rejected with exit 2"
+
+run_install_case "/ok" "" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "001: empty licence rejected with exit 2"
+
+run_install_case "/refused" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "001: HTTP 403 shop refusal rejected with exit 2"
+
+# --- 001 Parity drift check (positive + negative) ---
+if bash "$ROOT_DIR/scripts/check-parity.sh" >/dev/null 2>&1; then
+  pass "001: action.yml install body matches scripts/install-pipesure.sh byte-for-byte"
+else
+  fail "001: action.yml install body drifted from scripts/install-pipesure.sh"
+fi
+
+DRIFT_COPY="$WORK/drifted-install.sh"
+cp "$ROOT_DIR/scripts/install-pipesure.sh" "$DRIFT_COPY" 2>/dev/null || : > "$DRIFT_COPY"
+printf '# drift\n' >> "$DRIFT_COPY"
+if bash "$ROOT_DIR/scripts/check-parity.sh" "$ROOT_DIR/action.yml" "$DRIFT_COPY" >/dev/null 2>&1; then
+  fail "001: parity check failed to detect drifted script"
+else
+  pass "001: parity check fails closed on any 1-line difference"
+fi
+
+# --- 003 Regression: GitHub API non-2xx responses leave no settings file and record *.error ---
+API_ERR_ROUTES="$WORK/api-err-routes.json"
+cat > "$API_ERR_ROUTES" <<'EOF'
+{
+  "/repos/octo/forbidden": {
+    "status": 403,
+    "body": "{\"message\":\"Resource not accessible by integration\"}"
+  },
+  "/repos/octo/partial": {
+    "status": 200,
+    "body": "{\"default_branch\":\"main\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/partial/branches/main": {
+    "status": 404,
+    "body": "{\"message\":\"Branch not found\"}"
+  },
+  "/repos/octo/partial/rules/branches/main": {
+    "status": 500,
+    "body": "Internal Server Error"
+  }
+}
+EOF
+start_server "$API_ERR_ROUTES" no
+API_ERR_PORT="$STARTED_PORT"
+
+ERR_OUT_403="$WORK/out-003-403"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+GH_TOKEN="tok_test003" \
+OUT="$ERR_OUT_403" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_ERR_PORT}" \
+GITHUB_REPOSITORY="octo/forbidden" \
+bash "$WORK/step-1.sh" 2>"$WORK/step1-003.err"
+
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+OUT="$ERR_OUT_403" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$WORK/gh_out_003" \
+bash "$WORK/step-2.sh"
+assert_eq "$( [ -e "$ERR_OUT_403/api/repo.json" ] && echo yes || echo no )" "no" "003: HTTP 403 leaves no repo.json"
+assert_eq "$( [ -f "$ERR_OUT_403/api/repo.json.error" ] && grep -q 'HTTP 403' "$ERR_OUT_403/api/repo.json.error" && echo yes || echo no )" "yes" "003: HTTP 403 writes repo.json.error with HTTP status"
+assert_eq "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("yes" if r["verdict"]=="Blocked" and "HTTP 403" in r["reason"] else "no")' "$ERR_OUT_403/report.json")" "yes" "003: HTTP 403 produces Blocked verdict with HTTP 403 in reason"
+
+ERR_OUT_PARTIAL="$WORK/out-003-partial"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+GH_TOKEN="tok_test003" \
+OUT="$ERR_OUT_PARTIAL" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_ERR_PORT}" \
+GITHUB_REPOSITORY="octo/partial" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$ERR_OUT_PARTIAL/api/repo.json" ] && echo yes || echo no )" "yes" "003: HTTP 200 repo.json is saved"
+assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/branch.json" ] && echo yes || echo no )" "no" "003: HTTP 404 leaves no branch.json"
+assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/rules.json" ] && echo yes || echo no )" "no" "003: HTTP 500 leaves no rules.json"
+assert_eq "$( [ -f "$ERR_OUT_PARTIAL/api/branch.json.error" ] && grep -q 'HTTP 404' "$ERR_OUT_PARTIAL/api/branch.json.error" && [ -f "$ERR_OUT_PARTIAL/api/rules.json.error" ] && grep -q 'HTTP 500' "$ERR_OUT_PARTIAL/api/rules.json.error" && echo yes || echo no )" "yes" "003: HTTP 404/500 write branch.json.error and rules.json.error"
+
+# --- 005 Regression: licence containing quotes, backslashes or newlines rejected before curl ---
+INJ_ROUTES="$WORK/inj-routes.json"
+cat > "$INJ_ROUTES" <<'EOF'
+{
+  "/injected": {"status": 200, "body": "injected-reached"}
+}
+EOF
+start_server "$INJ_ROUTES" no
+INJ_PORT="$STARTED_PORT"
+INJ_LOG="$STARTED_LOG"
+
+INJ_LICENCE="$(printf 'ps1.abc"\nurl = "http://127.0.0.1:%s/injected"' "$INJ_PORT")"
+run_install_case "/ok" "$INJ_LICENCE" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with quote and newline curl directive exits 2"
+assert_eq "$(wc -l < "$INJ_LOG" | tr -d ' ')" "0" "005: injected curl config URL is never contacted"
+
+run_install_case "/ok" 'ps1.abc"def' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with double quote exits 2"
+
+run_install_case "/ok" 'ps1.abc\def' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with backslash exits 2"
+
+run_install_case "/ok" "ps1.abc def" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with space exits 2"
+
+run_install_case "/ok" $'ps1.abc\n' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with trailing newline exits 2"
+
+assert_eq "$(python3 -c '
+import re, sys
+txt = open(sys.argv[1], "r", encoding="utf-8").read()
+fence = chr(96) * 3
+blocks = re.findall(fence + r"sh\n(.*?)" + fence, txt, flags=re.S)
+ok = len(blocks) >= 2 and all("[!A-Za-z0-9._-]" in b for b in blocks if "--config -" in b)
+print("yes" if ok else "no")
+' "$ROOT_DIR/README.md")" "yes" "005: README curl --config examples validate key/licence format"
+
+# --- 002 Regression: GH_TOKEN passed via curl --config stdin, never in curl argv (/proc/*/cmdline) ---
+API_SLOW_ROUTES="$WORK/api-slow-routes.json"
+cat > "$API_SLOW_ROUTES" <<'EOF'
+{
+  "/repos/octo/slow": {
+    "status": 200,
+    "delay_ms": 400,
+    "body": "{\"default_branch\":\"main\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/slow/branches/main": {"status": 200, "body": "{\"protected\":true}"},
+  "/repos/octo/slow/rules/branches/main": {"status": 200, "body": "[]"}
+}
+EOF
+start_server "$API_SLOW_ROUTES" no
+API_SLOW_PORT="$STARTED_PORT"
+API_SLOW_LOG="$STARTED_LOG"
+
+SENTINEL_GH_TOKEN="tok_cmdline_002"
+CMDLINE_LEAK_FILE="$WORK/cmdline-leak-002"
+python3 -c '
+import glob, os, sys, time
+sentinel = sys.argv[1].encode("utf-8")
+out_path = sys.argv[2]
+uid = os.getuid()
+deadline = time.monotonic() + 2.5
+leaked = False
+while time.monotonic() < deadline and not leaked:
+    for p in glob.glob("/proc/[0-9]*/cmdline"):
+        try:
+            st = os.stat(p)
+            if st.st_uid != uid:
+                continue
+            data = open(p, "rb").read()
+        except OSError:
+            continue
+        parts = data.split(b"\x00")
+        exe = os.path.basename(parts[0]) if parts else b""
+        if exe == b"curl" and sentinel in data:
+            leaked = True
+            break
+    time.sleep(0.02)
+with open(out_path, "w", encoding="utf-8") as f:
+    f.write("leaked\n" if leaked else "clean\n")
+' "$SENTINEL_GH_TOKEN" "$CMDLINE_LEAK_FILE" &
+SAMPLER_PID=$!
+
+OUT_002="$WORK/out-002"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+GH_TOKEN="$SENTINEL_GH_TOKEN" \
+OUT="$OUT_002" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_SLOW_PORT}" \
+GITHUB_REPOSITORY="octo/slow" \
+bash "$WORK/step-1.sh" 2>/dev/null
+
+wait "$SAMPLER_PID" || true
+assert_eq "$(tr -d '\r\n' < "$CMDLINE_LEAK_FILE")" "clean" "002: GH_TOKEN never appears in curl /proc/*/cmdline argv"
+assert_eq "$( [ -f "$OUT_002/api/repo.json" ] && grep -q "\"authorization\": \"Bearer $SENTINEL_GH_TOKEN\"" "$API_SLOW_LOG" && echo yes || echo no )" "yes" "002: API call still authenticates via stdin curl --config and saves repo.json"
+
+OUT_002_BAD="$WORK/out-002-bad"
+INJ_GH_TOKEN="$(printf 'tok_bad"\nurl = "http://127.0.0.1:%s/injected"' "$INJ_PORT")"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+GH_TOKEN="$INJ_GH_TOKEN" \
+OUT="$OUT_002_BAD" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_SLOW_PORT}" \
+GITHUB_REPOSITORY="octo/slow" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ ! -e "$OUT_002_BAD/api/repo.json" ] && [ "$(wc -l < "$INJ_LOG" | tr -d ' ')" = "0" ] && echo yes || echo no )" "yes" "002: malformed GH_TOKEN with quote/newline cannot inject curl directives"
+
+# --- 004 Regression: default branch with '#', '?', '%', '/' or space is percent-encoded without double-encoding ---
+API_BRANCH_ROUTES="$WORK/api-branch-routes.json"
+cat > "$API_BRANCH_ROUTES" <<'EOF'
+{
+  "/repos/octo/weird-branch": {
+    "status": 200,
+    "body": "{\"default_branch\":\"release/v1#rc?x=1 100%\",\"visibility\":\"private\"}"
+  },
+  "/repos/octo/weird-branch/branches/release%2Fv1%23rc%3Fx%3D1%20100%25": {
+    "status": 200,
+    "body": "{\"protected\":true}"
+  },
+  "/repos/octo/weird-branch/rules/branches/release%2Fv1%23rc%3Fx%3D1%20100%25": {
+    "status": 200,
+    "body": "[{\"type\":\"pull_request\"}]"
+  }
+}
+EOF
+start_server "$API_BRANCH_ROUTES" no
+API_BRANCH_PORT="$STARTED_PORT"
+API_BRANCH_LOG="$STARTED_LOG"
+
+OUT_004_RAW="$WORK/out-004-raw"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+GH_TOKEN="tok_test004" \
+OUT="$OUT_004_RAW" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_BRANCH_PORT}" \
+GITHUB_REPOSITORY="octo/weird-branch" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$OUT_004_RAW/api/branch.json" ] && [ -f "$OUT_004_RAW/api/rules.json" ] && echo yes || echo no )" "yes" "004: raw default-branch with #, ?, %, /, space is percent-encoded and saves branch.json + rules.json"
+assert_eq "$(grep -c 'release%2Fv1%23rc%3Fx%3D1%20100%25' "$API_BRANCH_LOG" || true)" "2" "004: mock API received exact percent-encoded branch and rules URIs"
+
+# Pre-encoded binary stub (matches real pipesure binary behaviour) must not be double-encoded.
+PREENC_BIN="$WORK/preenc-pipesure-bin"
+cat > "$PREENC_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "default-branch" ]; then
+  python3 -c '
+import json, sys, urllib.parse
+d = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+print(urllib.parse.quote(d["default_branch"], safe="-._~"))
+' "$2"
+  exit 0
+fi
+exit 2
+EOF
+chmod +x "$PREENC_BIN"
+PREENC_SHA="$(sha256sum "$PREENC_BIN" | cut -d ' ' -f 1)"
+
+OUT_004_PRE="$WORK/out-004-pre"
+PIPESURE="$PREENC_BIN" \
+PIPESURE_SHA256="$PREENC_SHA" \
+GH_TOKEN="tok_test004" \
+OUT="$OUT_004_PRE" \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_BRANCH_PORT}" \
+GITHUB_REPOSITORY="octo/weird-branch" \
+bash "$WORK/step-1.sh" 2>/dev/null
+assert_eq "$( [ -f "$OUT_004_PRE/api/branch.json" ] && [ -f "$OUT_004_PRE/api/rules.json" ] && echo yes || echo no )" "yes" "004: pre-encoded default-branch output is not double-encoded"
+
+# --- 006 Regression: GITHUB_ENV and GITHUB_OUTPUT use heredoc delimiters and reject control chars ---
+run_install_case "/ok" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$( [ "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_env" || true)" -ge 2 ] && echo yes || echo no )" "yes" "006: install step writes GITHUB_ENV variables with heredoc delimiters"
+assert_eq "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_out" || true)" "1" "006: install step writes download output with heredoc delimiter"
+
+GH_OUT_006_OK="$WORK/gh_out_006_ok"
+: > "$GH_OUT_006_OK"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+OUT="$WORK/out-006-ok" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_OK" \
+bash "$WORK/step-2.sh"
+assert_eq "$(grep -c '<<PIPESURE_EOF_' "$GH_OUT_006_OK" || true)" "1" "006: run step writes report output with heredoc delimiter"
+
+GH_OUT_006_BAD="$WORK/gh_out_006_bad"
+: > "$GH_OUT_006_BAD"
+set +e
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$WORK/pipesure-report"$'\ninjected=evil' \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_006_OUT=$?
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$WORK/out-006-badroot" \
+ROOT=$'.\ninjected=evil' \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_006_ROOT=$?
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="tok_test006" \
+OUT="$WORK/pipesure-report"$'\ninjected=evil' \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+GITHUB_REPOSITORY="octo/demo" \
+bash "$WORK/step-1.sh" 2>/dev/null
+RC_006_STEP1=$?
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$WORK/bad"$'\n'"tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_PORT}/ok" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$WORK/gh_env_006_bad" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-0.sh" >/dev/null 2>&1
+RC_006_TMP=$?
+set -e
+assert_eq "$RC_006_OUT" "2" "006: multi-line inputs.output rejected in run step with exit 2"
+assert_eq "$RC_006_ROOT" "2" "006: multi-line inputs.path rejected in run step with exit 2"
+assert_eq "$RC_006_STEP1" "2" "006: multi-line inputs.output rejected in settings step with exit 2"
+assert_eq "$RC_006_TMP" "2" "006: multi-line PIPESURE_TMP rejected in install step with exit 2"
+assert_eq "$(wc -l < "$GH_OUT_006_BAD" | tr -d ' ')" "0" "006: rejected multi-line inputs leave GITHUB_OUTPUT untouched"
+
+# --- 007 Regression: signed manifest parsed with strict JSON parser (accepts whitespace, rejects duplicate keys) ---
+SPACED_MANIFEST="$(printf '{\n  "version": "v0.4.0",\n  "target": "%s",\n  "sha256": "%s",\n  "download": "dl_spaced007"\n}' "$HOST_TARGET" "$PAYLOAD_SHA")"
+{
+  IFS= read -r SPACED_M64
+  IFS= read -r SPACED_SIG
+} < <(sign_manifest "$SPACED_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+DUP_SHA_MANIFEST="{\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_dupsha\"}"
+{
+  IFS= read -r DUP_SHA_M64
+  IFS= read -r DUP_SHA_SIG
+} < <(sign_manifest "$DUP_SHA_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+DUP_VER_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.0.1\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_dupver\"}"
+{
+  IFS= read -r DUP_VER_M64
+  IFS= read -r DUP_VER_SIG
+} < <(sign_manifest "$DUP_VER_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+MALFORMED_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"$HOST_TARGET\",\"download\":\"dl_broken\""
+{
+  IFS= read -r MALFORMED_M64
+  IFS= read -r MALFORMED_SIG
+} < <(sign_manifest "$MALFORMED_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+SHOP_007_ROUTES="$WORK/shop-007-routes.json"
+python3 -c '
+import json, sys
+p_bin, t = sys.argv[1], sys.argv[2]
+(spm, sps, dsm, dss, dvm, dvs, mm, ms) = sys.argv[3:11]
+routes = {
+    f"/spaced/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": spm, "X-Pipesure-Manifest-Sig": sps}
+    },
+    f"/dup-sha/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dsm, "X-Pipesure-Manifest-Sig": dss}
+    },
+    f"/dup-ver/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dvm, "X-Pipesure-Manifest-Sig": dvs}
+    },
+    f"/malformed/v1/dl/pipesure-check/v0.4.0/{t}": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": mm, "X-Pipesure-Manifest-Sig": ms}
+    },
+}
+with open(sys.argv[11], "w", encoding="utf-8") as f:
+    json.dump(routes, f)
+' "$PAYLOAD_BIN" "$HOST_TARGET" \
+  "$SPACED_M64" "$SPACED_SIG" \
+  "$DUP_SHA_M64" "$DUP_SHA_SIG" \
+  "$DUP_VER_M64" "$DUP_VER_SIG" \
+  "$MALFORMED_M64" "$MALFORMED_SIG" \
+  "$SHOP_007_ROUTES"
+
+start_server "$SHOP_007_ROUTES" tls
+SHOP_007_PORT="$STARTED_PORT"
+
+run_install_007() {
+  local subpath="$1"
+  local cdir
+  cdir="$(mktemp -d "$WORK/c007.XXXXXX")"
+  : > "$cdir/gh_env"
+  : > "$cdir/gh_out"
+  set +e
+  CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  PIPESURE_TMP="$cdir/tmp" \
+  PIPESURE_SHOP="https://127.0.0.1:${SHOP_007_PORT}${subpath}" \
+  PIPESURE_VERSION="v0.4.0" \
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  GITHUB_ENV="$cdir/gh_env" \
+  GITHUB_OUTPUT="$cdir/gh_out" \
+  bash "$WORK/step-0.sh" >"$cdir/stdout" 2>"$cdir/stderr"
+  RC_007=$?
+  set -e
+  CDIR_007="$cdir"
+}
+
+run_install_007 "/spaced"
+assert_eq "$RC_007" "0" "007: signed manifest with whitespace after colons succeeds"
+assert_eq "$(grep -q 'dl_spaced007' "$CDIR_007/gh_out" && echo yes || echo no)" "yes" "007: spaced manifest parses download id cleanly"
+
+run_install_007 "/dup-sha"
+assert_eq "$RC_007" "1" "007: duplicate sha256 keys in signed manifest rejected with exit 1"
+
+run_install_007 "/dup-ver"
+assert_eq "$RC_007" "1" "007: duplicate version keys in signed manifest rejected with exit 1"
+
+run_install_007 "/malformed"
+assert_eq "$RC_007" "1" "007: malformed JSON manifest rejected with exit 1"
+
+# --- 008 Regression: SECURITY.md and action.yml agree only decoded claims appear in reports, never raw licence ---
+assert_eq "$(python3 -c '
+import sys, yaml
+action_txt = open(sys.argv[1], "r", encoding="utf-8").read()
+sec_txt = open(sys.argv[2], "r", encoding="utf-8").read()
+doc = yaml.safe_load(action_txt)
+desc = doc["inputs"]["licence"]["description"]
+ok = (
+    "It downloads the binary and is recorded in the report." not in action_txt
+    and "claims" in desc and "never" in desc
+    and "claims" in sec_txt and "never" in sec_txt
+)
+print("yes" if ok else "no")
+' "$ROOT_DIR/action.yml" "$ROOT_DIR/SECURITY.md")" "yes" "008: SECURITY.md and action.yml agree only decoded non-secret claims appear in reports"
+
+SENTINEL_LIC_008="ps1.sentinel_008"
+OUT_008_OK="$WORK/out-008-ok"
+PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
+OUT="$OUT_008_OK" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="$SENTINEL_LIC_008" \
+GITHUB_OUTPUT="$WORK/gh_out_008_ok" \
+bash "$WORK/step-2.sh"
+
+LEAK_COUNT_008=0
+CLAIM_COUNT_008=0
+for rf in report.json report.html report.sarif summary.md; do
+  if grep -Fq -- "$SENTINEL_LIC_008" "$OUT_008_OK/$rf"; then
+    LEAK_COUNT_008=$((LEAK_COUNT_008 + 1))
+  fi
+  if grep -Fq -- "Licensed to Example Org until 2026-12-31" "$OUT_008_OK/$rf"; then
+    CLAIM_COUNT_008=$((CLAIM_COUNT_008 + 1))
+  fi
+done
+assert_eq "$LEAK_COUNT_008" "0" "008: sentinel licence token never appears in any of the four report files"
+assert_eq "$CLAIM_COUNT_008" "4" "008: decoded owner/expiry claims appear in all four report files"
+
+LEAKY_BIN="$WORK/leaky-pipesure-bin"
+cat > "$LEAKY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$out"
+printf '{"licence":"%s"}\n' "${PIPESURE_LICENCE:-}" > "$out/report.json"
+printf '<html>ok</html>\n' > "$out/report.html"
+printf '{}\n' > "$out/report.sarif"
+printf '# ok\n' > "$out/summary.md"
+EOF
+chmod +x "$LEAKY_BIN"
+LEAKY_SHA="$(sha256sum "$LEAKY_BIN" | cut -d ' ' -f 1)"
+
+OUT_008_LEAK="$WORK/out-008-leak"
+set +e
+PIPESURE="$LEAKY_BIN" \
+PIPESURE_SHA256="$LEAKY_SHA" \
+OUT="$OUT_008_LEAK" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="$SENTINEL_LIC_008" \
+GITHUB_OUTPUT="$WORK/gh_out_008_leak" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_008_LEAK=$?
+set -e
+assert_eq "$RC_008_LEAK" "1" "008: run step fails closed if raw licence token ever reaches a report file"
+
+# --- 009 Regression: 0700 permissions and binary SHA-256 + signed-manifest re-verification before execution ---
+PERM_BASE="/dev/shm"
+if [ ! -d "$PERM_BASE" ] || [ ! -w "$PERM_BASE" ]; then
+  PERM_BASE="/tmp"
+fi
+PERM_TMP_009="$(mktemp -d "$PERM_BASE/pipesure-009.XXXXXX")"
+: > "$WORK/gh_env_009"
+: > "$WORK/gh_out_009_inst"
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$PERM_TMP_009" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_PORT}/ok" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$WORK/gh_env_009" \
+GITHUB_OUTPUT="$WORK/gh_out_009_inst" \
+bash "$WORK/step-0.sh" >/dev/null 2>&1
+
+DL_DIR_009="$PERM_TMP_009/pipesure-dl"
+assert_eq "$(stat -c '%a' "$DL_DIR_009")" "700" "009: pipesure-dl directory permissions are 0700"
+assert_eq "$(stat -c '%a' "$DL_DIR_009/pipesure")" "700" "009: verified binary permissions are 0700"
+
+TAMPER_MARKER="$WORK/tamper-executed-009"
+rm -f "$TAMPER_MARKER"
+cat > "$DL_DIR_009/pipesure" <<EOF
+#!/usr/bin/env bash
+printf 'swapped\n' >> "$TAMPER_MARKER"
+exit 0
+EOF
+chmod 700 "$DL_DIR_009/pipesure"
+
+set +e
+(
+  eval "$(load_github_env "$WORK/gh_env_009")"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  OUT="$WORK/out-009-run" \
+  ROOT="$SAMPLE_REPO" \
+  FAIL_ON="" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  GITHUB_OUTPUT="$WORK/gh_out_009" \
+  bash "$WORK/step-2.sh" 2>/dev/null
+)
+RC_009_RUN=$?
+(
+  eval "$(load_github_env "$WORK/gh_env_009")"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  GH_TOKEN="tok_test009" \
+  OUT="$WORK/out-009-step1" \
+  ROOT="$SAMPLE_REPO" \
+  GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+  GITHUB_REPOSITORY="octo/demo" \
+  bash "$WORK/step-1.sh" 2>/dev/null
+)
+RC_009_STEP1=$?
+set -e
+rm -rf "$PERM_TMP_009"
+assert_eq "$RC_009_RUN" "1" "009: run step refuses swapped binary with exit 1"
+assert_eq "$RC_009_STEP1" "1" "009: settings step refuses swapped binary with exit 1"
+assert_eq "$( [ -e "$TAMPER_MARKER" ] && echo yes || echo no )" "no" "009: swapped binary is never executed in later steps"
+
+# --- 010 Regression: Darwin-arm64 locates Homebrew openssl@3 (or fails pre-download on LibreSSL) and docs match ---
+DARWIN_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"aarch64-apple-darwin\",\"download\":\"dl_darwin010\"}"
+{
+  IFS= read -r DARWIN_M64
+  IFS= read -r DARWIN_SIG
+} < <(sign_manifest "$DARWIN_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+SHOP_010_ROUTES="$WORK/shop-010-routes.json"
+python3 -c '
+import json, sys
+p_bin, dm, ds, out = sys.argv[1:5]
+routes = {
+    "/darwin/v1/dl/pipesure-check/v0.4.0/aarch64-apple-darwin": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dm, "X-Pipesure-Manifest-Sig": ds}
+    },
+    "/darwin-nobrew/v1/dl/pipesure-check/v0.4.0/aarch64-apple-darwin": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dm, "X-Pipesure-Manifest-Sig": ds}
+    },
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(routes, f)
+' "$PAYLOAD_BIN" "$DARWIN_M64" "$DARWIN_SIG" "$SHOP_010_ROUTES"
+
+start_server "$SHOP_010_ROUTES" tls
+SHOP_010_PORT="$STARTED_PORT"
+SHOP_010_LOG="$STARTED_LOG"
+
+REAL_OPENSSL="$(command -v openssl)"
+FAKE_DARWIN_BIN="$WORK/fake-darwin-bin"
+FAKE_BREW="$WORK/fake-homebrew"
+mkdir -p "$FAKE_DARWIN_BIN" "$FAKE_BREW/opt/openssl@3/bin"
+ln -s "$REAL_OPENSSL" "$FAKE_BREW/opt/openssl@3/bin/openssl"
+
+cat > "$FAKE_DARWIN_BIN/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+  *) echo "Darwin arm64" ;;
+esac
+EOF
+cat > "$FAKE_DARWIN_BIN/openssl" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "version" ]; then
+  echo "LibreSSL 3.3.6"
+  exit 0
+fi
+for arg in "\$@"; do
+  if [ "\$arg" = "-rawin" ]; then
+    echo "pkeyutl: Unknown option: -rawin" >&2
+    exit 1
+  fi
+done
+exec "$REAL_OPENSSL" "\$@"
+EOF
+chmod +x "$FAKE_DARWIN_BIN/uname" "$FAKE_DARWIN_BIN/openssl"
+
+DARWIN_OK_DIR="$WORK/darwin-ok"
+mkdir -p "$DARWIN_OK_DIR"
+: > "$DARWIN_OK_DIR/gh_env"
+: > "$DARWIN_OK_DIR/gh_out"
+: > "$DARWIN_OK_DIR/gh_path"
+set +e
+PATH="$FAKE_DARWIN_BIN:$PATH" \
+HOMEBREW_PREFIX="$FAKE_BREW" \
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$DARWIN_OK_DIR/tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_010_PORT}/darwin" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$DARWIN_OK_DIR/gh_env" \
+GITHUB_OUTPUT="$DARWIN_OK_DIR/gh_out" \
+GITHUB_PATH="$DARWIN_OK_DIR/gh_path" \
+bash "$WORK/step-0.sh" >"$DARWIN_OK_DIR/stdout" 2>"$DARWIN_OK_DIR/stderr"
+RC_010_INSTALL=$?
+
+RC_010_RUN=99
+if [ "$RC_010_INSTALL" -eq 0 ]; then
+  (
+    eval "$(load_github_env "$DARWIN_OK_DIR/gh_env")"
+    PATH="$FAKE_DARWIN_BIN:$PATH" \
+    HOMEBREW_PREFIX="$FAKE_BREW" \
+    PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+    OUT="$DARWIN_OK_DIR/report" \
+    ROOT="$SAMPLE_REPO" \
+    FAIL_ON="" \
+    PIPESURE_LICENCE="ps1.test_lic" \
+    GITHUB_OUTPUT="$DARWIN_OK_DIR/gh_out_run" \
+    bash "$WORK/step-2.sh" >/dev/null 2>&1
+  )
+  RC_010_RUN=$?
+fi
+
+DARWIN_NOBREW_DIR="$WORK/darwin-nobrew"
+mkdir -p "$DARWIN_NOBREW_DIR"
+: > "$DARWIN_NOBREW_DIR/gh_env"
+: > "$DARWIN_NOBREW_DIR/gh_out"
+PATH="$FAKE_DARWIN_BIN:$PATH" \
+HOMEBREW_PREFIX="$WORK/nonexistent-brew" \
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$DARWIN_NOBREW_DIR/tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_010_PORT}/darwin-nobrew" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$DARWIN_NOBREW_DIR/gh_env" \
+GITHUB_OUTPUT="$DARWIN_NOBREW_DIR/gh_out" \
+bash "$WORK/step-0.sh" >"$DARWIN_NOBREW_DIR/stdout" 2>"$DARWIN_NOBREW_DIR/stderr"
+RC_010_NOBREW=$?
+set -e
+
+assert_eq "$RC_010_INSTALL" "0" "010: Darwin-arm64 locates Homebrew openssl@3 and verifies Ed25519 manifest"
+assert_eq "$RC_010_RUN" "0" "010: Darwin-arm64 run step re-verifies manifest via Homebrew openssl@3"
+assert_eq "$RC_010_NOBREW" "2" "010: Darwin-arm64 with only LibreSSL exits 2 cleanly"
+assert_eq "$(grep -c 'darwin-nobrew' "$SHOP_010_LOG" || true)" "0" "010: Darwin-arm64 LibreSSL prerequisite check refuses before contacting shop"
+assert_eq "$(grep -qi 'openssl@3' "$ROOT_DIR/README.md" && grep -qi 'macOS arm64' "$ROOT_DIR/README.md" && echo yes || echo no)" "yes" "010: README documents macOS arm64 runner support and Homebrew openssl@3 requirement"
+
+printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
+if [ "$FAIL" -ne 0 ]; then
+  exit 1
+fi

@@ -17,7 +17,9 @@ inputs:
       Required. The licence from the shop (ps1.…), from a repository secret:
       `licence: ${{ secrets.PIPESURE_LICENCE }}`. Buy credits at
       https://shop.gatemark.net, redeem them for a licence (POST /v1/redeem),
-      store it as a secret. It downloads the binary and is recorded in the report.
+      store it as a secret. It downloads the binary; only its decoded non-secret
+      claims (owner and expiry) are recorded in the report, never the licence
+      token itself.
     required: true
   token:
     description: >-
@@ -60,17 +62,41 @@ runs:
         PIPESURE_SHOP: https://shop.gatemark.net
         PIPESURE_VERSION: v0.4.0
         PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
-      # The body is scripts/install-pipesure.sh of the pipesure-check repository, verbatim.
+      # The body is scripts/install-pipesure.sh in this repository, verbatim (checked by scripts/check-parity.sh).
       run: |
         set -euo pipefail
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
         case "$(uname -s)-$(uname -m)" in
           Linux-x86_64) target=x86_64-unknown-linux-musl ;;
           Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-musl ;;
-          Darwin-arm64) target=aarch64-apple-darwin ;;
+          Darwin-arm64)
+            target=aarch64-apple-darwin
+            for brew_ssl in "${HOMEBREW_PREFIX:-}/opt/openssl@3/bin" /opt/homebrew/opt/openssl@3/bin /usr/local/opt/openssl@3/bin; do
+              if [ -n "${brew_ssl%/opt/openssl@3/bin}" ] && no_ctl "$brew_ssl" && [ -x "$brew_ssl/openssl" ]; then
+                PATH="$brew_ssl:$PATH"
+                export PATH
+                if [ -n "${GITHUB_PATH:-}" ]; then
+                  printf '%s\n' "$brew_ssl" >> "$GITHUB_PATH"
+                fi
+                break
+              fi
+            done
+            case "$(openssl version 2>/dev/null || true)" in
+              LibreSSL*|"")
+                echo "pipesure: macOS arm64 requires OpenSSL 1.1.1+ with Ed25519 (install Homebrew openssl@3)" >&2
+                exit 2
+                ;;
+            esac
+            ;;
           *) echo "pipesure: no binary for $(uname -s) $(uname -m) (Linux x86_64 or arm64, macOS arm64; Windows x64 uses the PowerShell step)" >&2; exit 2 ;;
         esac
         if [ -z "${PIPESURE_LICENCE:-}" ]; then
           echo "pipesure: a licence is required: buy credits at $PIPESURE_SHOP, redeem them for a licence (POST /v1/redeem), store it as the secret PIPESURE_LICENCE and pass it to this step" >&2
+          exit 2
+        fi
+        valid_licence() { local LC_ALL=C; case "$1" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+        if ! valid_licence "$PIPESURE_LICENCE"; then
+          echo "pipesure: the licence contains invalid characters (expected only A-Za-z0-9._-)" >&2
           exit 2
         fi
         if [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
@@ -78,8 +104,17 @@ runs:
           exit 2
         fi
         case "$PIPESURE_SHOP" in https://*) ;; *) echo "pipesure: the shop address must be https" >&2; exit 2 ;; esac
+        if [ -z "${PIPESURE_TMP:-}" ] || ! no_ctl "$PIPESURE_TMP"; then
+          echo "pipesure: PIPESURE_TMP must be non-empty and must not contain control characters" >&2
+          exit 2
+        fi
         tmp="$PIPESURE_TMP/pipesure-dl"
-        mkdir -p "$tmp"
+        if [ -L "$tmp" ]; then
+          echo "pipesure: download directory must not be a symlink" >&2
+          exit 1
+        fi
+        ( umask 077 && mkdir -p "$tmp" )
+        chmod 700 "$tmp"
         bin="$tmp/pipesure"
         rm -f "$bin"
         # The licence reaches curl through its configuration on stdin: it is never an argument.
@@ -114,13 +149,52 @@ runs:
         fi
         case "$verdict" in *"Verified Successfully"*) ;; *) echo "pipesure: openssl gave no verdict on the manifest signature; the file is not run" >&2; exit 1 ;; esac
         b64url "$m64" > "$tmp/manifest.json"
-        field() { tr -d '\n' < "$tmp/manifest.json" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p"; }
-        sha="$(field sha256)"; version="$(field version)"; mtarget="$(field target)"; download="$(field download)"
+        if ! python3 -c '
+        import json, sys
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("duplicate key: " + k)
+                d[k] = v
+            return d
+        with open(sys.argv[1], "r", encoding="utf-8") as f:
+            obj = json.load(f, object_pairs_hook=no_dups)
+        if not isinstance(obj, dict):
+            raise ValueError("manifest must be a JSON object")
+        out = []
+        for k in ("sha256", "version", "target"):
+            v = obj.get(k)
+            if not isinstance(v, str):
+                raise ValueError("missing string field: " + k)
+            out.append(v)
+        dl = obj.get("download", "")
+        if dl is None:
+            dl = ""
+        if not isinstance(dl, str):
+            raise ValueError("download must be a string")
+        out.append(dl)
+        for v in out:
+            if "\n" in v or "\r" in v or "\x00" in v:
+                raise ValueError("control character in manifest field")
+        with open(sys.argv[2], "w", encoding="utf-8") as out_f:
+            out_f.write("\n".join(out) + "\n")
+        ' "$tmp/manifest.json" "$tmp/manifest.fields" 2>/dev/null; then
+          echo "pipesure: the signed manifest is not valid JSON; the file is not run" >&2
+          exit 1
+        fi
+        {
+          IFS= read -r sha
+          IFS= read -r version
+          IFS= read -r mtarget
+          IFS= read -r download
+        } < "$tmp/manifest.fields"
         if [ "$version" != "$PIPESURE_VERSION" ] || [ "$mtarget" != "$target" ]; then
           echo "pipesure: the manifest is for $version $mtarget, not $PIPESURE_VERSION $target; the file is not run" >&2
           exit 1
         fi
         case "$sha" in *[!0-9a-f]*|"") echo "pipesure: the manifest carries no digest" >&2; exit 1 ;; esac
+        if [ "${#sha}" -ne 64 ]; then echo "pipesure: the manifest carries an invalid SHA-256 digest" >&2; exit 1; fi
         if command -v sha256sum >/dev/null; then
           echo "$sha  $bin" | sha256sum --check --strict --quiet
         else
@@ -128,15 +202,24 @@ runs:
           if [ "$actual" != "$sha" ]; then echo "pipesure: the file does not match the manifest's SHA-256" >&2; exit 1; fi
         fi
         case "$download" in *[!A-Za-z0-9_-]*|"") download=unknown ;; esac
-        chmod +x "$bin"
+        chmod 700 "$bin"
         echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
         if [ -n "${GITHUB_ENV:-}" ]; then
-          printf 'PIPESURE=%s\nPIPESURE_DOWNLOAD=%s\n' "$bin" "$download" >> "$GITHUB_ENV"
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          {
+            printf 'PIPESURE<<%s\n%s\n%s\n' "$eof" "$bin" "$eof"
+            printf 'PIPESURE_DOWNLOAD<<%s\n%s\n%s\n' "$eof" "$download" "$eof"
+            printf 'PIPESURE_SHA256<<%s\n%s\n%s\n' "$eof" "$sha" "$eof"
+          } >> "$GITHUB_ENV"
         else
           echo "##vso[task.setvariable variable=PIPESURE]$bin"
           echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
+          echo "##vso[task.setvariable variable=PIPESURE_SHA256]$sha"
         fi
-        echo "download=$download" >> "$GITHUB_OUTPUT"
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          printf 'download<<%s\n%s\n%s\n' "$eof" "$download" "$eof" >> "$GITHUB_OUTPUT"
+        fi
 
     - name: Read repository settings (read-only GitHub API)
       shell: bash
@@ -144,16 +227,159 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         OUT: ${{ inputs.output }}
         ROOT: ${{ inputs.path }}
+        PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
       run: |
         set -uo pipefail
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+        if [ -z "${OUT:-}" ] || [ -z "${ROOT:-}" ] || ! no_ctl "$OUT" || ! no_ctl "$ROOT"; then
+          echo "pipesure: path and output inputs must be non-empty and must not contain control characters" >&2
+          exit 2
+        fi
+        verify_pipesure() {
+          if [ -z "${PIPESURE:-}" ] || [ ! -f "$PIPESURE" ] || [ -L "$PIPESURE" ]; then
+            echo "pipesure: verified binary is missing or a symlink; refusing to run" >&2
+            exit 1
+          fi
+          case "${PIPESURE_SHA256:-}" in
+            *[!0-9a-f]*|"") echo "pipesure: missing verified binary digest; refusing to run" >&2; exit 1 ;;
+          esac
+          if [ "${#PIPESURE_SHA256}" -ne 64 ]; then
+            echo "pipesure: invalid verified binary digest; refusing to run" >&2
+            exit 1
+          fi
+          local dir actual msha vtmp verdict brew_ssl
+          if [ "$(uname -s)" = Darwin ]; then
+            for brew_ssl in "${HOMEBREW_PREFIX:-}/opt/openssl@3/bin" /opt/homebrew/opt/openssl@3/bin /usr/local/opt/openssl@3/bin; do
+              if [ -n "${brew_ssl%/opt/openssl@3/bin}" ] && [ -x "$brew_ssl/openssl" ]; then
+                PATH="$brew_ssl:$PATH"
+                export PATH
+                break
+              fi
+            done
+          fi
+          dir="$(dirname "$PIPESURE")"
+          if [ -f "$dir/manifest.msg" ] || [ -f "$dir/manifest.sig" ]; then
+            if [ -z "${PIPESURE_PUBLIC_KEY:-}" ] || [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
+              echo "pipesure: missing pinned key for manifest re-verification; refusing to run" >&2
+              exit 1
+            fi
+            if [ ! -f "$dir/manifest.msg" ] || [ ! -f "$dir/manifest.sig" ] || [ -L "$dir/manifest.msg" ] || [ -L "$dir/manifest.sig" ]; then
+              echo "pipesure: signed manifest missing or symlinked; refusing to run" >&2
+              exit 1
+            fi
+            vtmp="$(mktemp -d "$dir/verify.XXXXXX")"
+            b64url() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac; printf '%s' "$s" | base64 -d; }
+            { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; b64url "$PIPESURE_PUBLIC_KEY"; } > "$vtmp/key.der"
+            if ! openssl pkey -pubin -inform DER -in "$vtmp/key.der" -out "$vtmp/key.pem" 2>/dev/null || \
+               ! verdict="$(openssl pkeyutl -verify -pubin -inkey "$vtmp/key.pem" -rawin -in "$dir/manifest.msg" -sigfile "$dir/manifest.sig" 2>/dev/null)"; then
+              rm -rf "$vtmp"
+              echo "pipesure: manifest signature re-verification failed; refusing to run" >&2
+              exit 1
+            fi
+            case "$verdict" in
+              *"Verified Successfully"*) ;;
+              *) rm -rf "$vtmp"; echo "pipesure: manifest signature did not verify; refusing to run" >&2; exit 1 ;;
+            esac
+            msha="$(python3 -c '
+        import base64, json, sys
+        msg = open(sys.argv[1], "r", encoding="ascii").read()
+        if not msg.startswith("psm1."):
+            sys.exit(1)
+        b64 = msg[5:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        raw = base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8")
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("dup")
+                d[k] = v
+            return d
+        obj = json.loads(raw, object_pairs_hook=no_dups)
+        print(obj["sha256"])
+        ' "$dir/manifest.msg" 2>/dev/null)" || { rm -rf "$vtmp"; echo "pipesure: signed manifest parse failed; refusing to run" >&2; exit 1; }
+            rm -rf "$vtmp"
+            if [ "$msha" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary digest does not match signed manifest; refusing to run" >&2
+              exit 1
+            fi
+          fi
+          if command -v sha256sum >/dev/null; then
+            if ! echo "$PIPESURE_SHA256  $PIPESURE" | sha256sum --check --strict --quiet >/dev/null 2>&1; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          else
+            actual="$(shasum -a 256 "$PIPESURE" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          fi
+        }
+        verify_pipesure
         mkdir -p "$OUT/api"
         # The files checked in at the scanned commit, for PH-16's proof. No list, no proof.
         git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
-        # One GET per answer, no retries. A failed call leaves no file, so the
-        # checks that need it report Blocked with the reason.
-        api() { curl --silent --show-error --max-time 30 --header "Authorization: Bearer $GH_TOKEN" --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$OUT/api/$1" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2" || rm -f "$OUT/api/$1"; }
+        # One GET per answer, no retries. A failed or non-2xx call leaves no settings
+        # file (recording the HTTP status in *.error), so checks report Blocked.
+        valid_gh_token() { local LC_ALL=C; case "$1" in *[[:cntrl:][:space:]\"\\]*) return 1 ;; esac; }
+        api() {
+          local dst="$OUT/api/$1" tmp="$OUT/api/$1.tmp" code err
+          rm -f "$dst" "$tmp" "$dst.error"
+          if ! valid_gh_token "${GH_TOKEN:-}"; then
+            printf 'invalid GitHub token format\n' > "$dst.error"
+            echo "pipesure: GitHub API $1 skipped (invalid token format)" >&2
+            return 0
+          fi
+          if [ -n "${GH_TOKEN:-}" ]; then
+            code="$(printf 'header = "Authorization: Bearer %s"\n' "$GH_TOKEN" | curl --silent --show-error --fail-with-body --max-time 30 --config - --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          else
+            code="$(curl --silent --show-error --fail-with-body --max-time 30 --header "Accept: application/vnd.github+json" --header "X-GitHub-Api-Version: 2022-11-28" --output "$tmp" --write-out '%{http_code}' "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY$2")" || true
+          fi
+          case "$code" in
+            2??)
+              if [ -f "$tmp" ]; then
+                mv -f "$tmp" "$dst"
+              fi
+              ;;
+            *)
+              err=""
+              if [ -f "$tmp" ]; then
+                err="$(tr -d '\r\n' < "$tmp" | head -c 400)"
+                if [ -n "${GH_TOKEN:-}" ]; then err="${err//"$GH_TOKEN"/[REDACTED]}"; fi
+              fi
+              rm -f "$tmp" "$dst"
+              if [ -n "$err" ]; then
+                printf 'HTTP %s: %s\n' "${code:-000}" "$err" > "$dst.error"
+              else
+                printf 'HTTP %s\n' "${code:-000}" > "$dst.error"
+              fi
+              echo "pipesure: GitHub API $1 failed (HTTP ${code:-000})" >&2
+              ;;
+          esac
+        }
+        urlencode() {
+          local LC_ALL=C s="$1" i c hex
+          for (( i = 0; i < ${#s}; i++ )); do
+            c="${s:i:1}"
+            case "$c" in
+              [A-Za-z0-9._~-]) printf '%s' "$c" ;;
+              *) printf -v hex '%%%02X' "'$c"; printf '%s' "$hex" ;;
+            esac
+          done
+        }
+        is_percent_encoded() {
+          local LC_ALL=C
+          [[ "$1" =~ ^([A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})+$ ]]
+        }
         api repo.json ""
-        if branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")"; then
+        if [ -f "$OUT/api/repo.json" ] && branch="$("$PIPESURE" default-branch "$OUT/api/repo.json")" && [ -n "$branch" ]; then
+          if command -v jq >/dev/null 2>&1 && raw_branch="$(jq -er '.default_branch | strings' "$OUT/api/repo.json" 2>/dev/null)"; then
+            branch="$(urlencode "$raw_branch")"
+          elif ! is_percent_encoded "$branch"; then
+            branch="$(urlencode "$branch")"
+          fi
           api branch.json "/branches/$branch"
           api rules.json "/rules/branches/$branch"
         fi
@@ -165,9 +391,113 @@ runs:
         ROOT: ${{ inputs.path }}
         OUT: ${{ inputs.output }}
         FAIL_ON: ${{ inputs.fail-on }}
-        # Read by the binary and recorded in the report ("Licensed to <owner> until <date>").
+        # Read by the binary; only decoded non-secret claims ("Licensed to <owner> until <date>")
+        # appear in the report, never the bearer licence token.
         PIPESURE_LICENCE: ${{ inputs.licence }}
+        PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
       run: |
         set -euo pipefail
-        echo "report=$OUT/report.json" >> "$GITHUB_OUTPUT"
-        "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON"
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+        if [ -z "${OUT:-}" ] || [ -z "${ROOT:-}" ] || ! no_ctl "$OUT" || ! no_ctl "$ROOT" || ! no_ctl "${FAIL_ON:-}"; then
+          echo "pipesure: action inputs must not contain control characters" >&2
+          exit 2
+        fi
+        verify_pipesure() {
+          if [ -z "${PIPESURE:-}" ] || [ ! -f "$PIPESURE" ] || [ -L "$PIPESURE" ]; then
+            echo "pipesure: verified binary is missing or a symlink; refusing to run" >&2
+            exit 1
+          fi
+          case "${PIPESURE_SHA256:-}" in
+            *[!0-9a-f]*|"") echo "pipesure: missing verified binary digest; refusing to run" >&2; exit 1 ;;
+          esac
+          if [ "${#PIPESURE_SHA256}" -ne 64 ]; then
+            echo "pipesure: invalid verified binary digest; refusing to run" >&2
+            exit 1
+          fi
+          local dir actual msha vtmp verdict brew_ssl
+          if [ "$(uname -s)" = Darwin ]; then
+            for brew_ssl in "${HOMEBREW_PREFIX:-}/opt/openssl@3/bin" /opt/homebrew/opt/openssl@3/bin /usr/local/opt/openssl@3/bin; do
+              if [ -n "${brew_ssl%/opt/openssl@3/bin}" ] && [ -x "$brew_ssl/openssl" ]; then
+                PATH="$brew_ssl:$PATH"
+                export PATH
+                break
+              fi
+            done
+          fi
+          dir="$(dirname "$PIPESURE")"
+          if [ -f "$dir/manifest.msg" ] || [ -f "$dir/manifest.sig" ]; then
+            if [ -z "${PIPESURE_PUBLIC_KEY:-}" ] || [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
+              echo "pipesure: missing pinned key for manifest re-verification; refusing to run" >&2
+              exit 1
+            fi
+            if [ ! -f "$dir/manifest.msg" ] || [ ! -f "$dir/manifest.sig" ] || [ -L "$dir/manifest.msg" ] || [ -L "$dir/manifest.sig" ]; then
+              echo "pipesure: signed manifest missing or symlinked; refusing to run" >&2
+              exit 1
+            fi
+            vtmp="$(mktemp -d "$dir/verify.XXXXXX")"
+            b64url() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac; printf '%s' "$s" | base64 -d; }
+            { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; b64url "$PIPESURE_PUBLIC_KEY"; } > "$vtmp/key.der"
+            if ! openssl pkey -pubin -inform DER -in "$vtmp/key.der" -out "$vtmp/key.pem" 2>/dev/null || \
+               ! verdict="$(openssl pkeyutl -verify -pubin -inkey "$vtmp/key.pem" -rawin -in "$dir/manifest.msg" -sigfile "$dir/manifest.sig" 2>/dev/null)"; then
+              rm -rf "$vtmp"
+              echo "pipesure: manifest signature re-verification failed; refusing to run" >&2
+              exit 1
+            fi
+            case "$verdict" in
+              *"Verified Successfully"*) ;;
+              *) rm -rf "$vtmp"; echo "pipesure: manifest signature did not verify; refusing to run" >&2; exit 1 ;;
+            esac
+            msha="$(python3 -c '
+        import base64, json, sys
+        msg = open(sys.argv[1], "r", encoding="ascii").read()
+        if not msg.startswith("psm1."):
+            sys.exit(1)
+        b64 = msg[5:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        raw = base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8")
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("dup")
+                d[k] = v
+            return d
+        obj = json.loads(raw, object_pairs_hook=no_dups)
+        print(obj["sha256"])
+        ' "$dir/manifest.msg" 2>/dev/null)" || { rm -rf "$vtmp"; echo "pipesure: signed manifest parse failed; refusing to run" >&2; exit 1; }
+            rm -rf "$vtmp"
+            if [ "$msha" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary digest does not match signed manifest; refusing to run" >&2
+              exit 1
+            fi
+          fi
+          if command -v sha256sum >/dev/null; then
+            if ! echo "$PIPESURE_SHA256  $PIPESURE" | sha256sum --check --strict --quiet >/dev/null 2>&1; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          else
+            actual="$(shasum -a 256 "$PIPESURE" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          fi
+        }
+        verify_pipesure
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          printf 'report<<%s\n%s\n%s\n' "$eof" "$OUT/report.json" "$eof" >> "$GITHUB_OUTPUT"
+        fi
+        rc=0
+        "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON" || rc=$?
+        if [ -n "${PIPESURE_LICENCE:-}" ]; then
+          for rf in report.json report.html report.sarif summary.md; do
+            if [ -f "$OUT/$rf" ] && grep -Fq -- "$PIPESURE_LICENCE" "$OUT/$rf"; then
+              rm -f "$OUT/$rf"
+              echo "pipesure: raw licence value detected in $rf; refusing output" >&2
+              exit 1
+            fi
+          done
+        fi
+        exit "$rc"
