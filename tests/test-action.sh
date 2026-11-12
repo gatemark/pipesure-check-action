@@ -813,6 +813,76 @@ assert_eq "$RC_007" "1" "007: duplicate version keys in signed manifest rejected
 run_install_007 "/malformed"
 assert_eq "$RC_007" "1" "007: malformed JSON manifest rejected with exit 1"
 
+# --- 008 Regression: SECURITY.md and action.yml agree only decoded claims appear in reports, never raw licence ---
+assert_eq "$(python3 -c '
+import sys, yaml
+action_txt = open(sys.argv[1], "r", encoding="utf-8").read()
+sec_txt = open(sys.argv[2], "r", encoding="utf-8").read()
+doc = yaml.safe_load(action_txt)
+desc = doc["inputs"]["licence"]["description"]
+ok = (
+    "It downloads the binary and is recorded in the report." not in action_txt
+    and "claims" in desc and "never" in desc
+    and "claims" in sec_txt and "never" in sec_txt
+)
+print("yes" if ok else "no")
+' "$ROOT_DIR/action.yml" "$ROOT_DIR/SECURITY.md")" "yes" "008: SECURITY.md and action.yml agree only decoded non-secret claims appear in reports"
+
+SENTINEL_LIC_008="ps1.sentinel_008"
+OUT_008_OK="$WORK/out-008-ok"
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$OUT_008_OK" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="$SENTINEL_LIC_008" \
+GITHUB_OUTPUT="$WORK/gh_out_008_ok" \
+bash "$WORK/step-2.sh"
+
+LEAK_COUNT_008=0
+CLAIM_COUNT_008=0
+for rf in report.json report.html report.sarif summary.md; do
+  if grep -Fq -- "$SENTINEL_LIC_008" "$OUT_008_OK/$rf"; then
+    LEAK_COUNT_008=$((LEAK_COUNT_008 + 1))
+  fi
+  if grep -Fq -- "Licensed to Example Org until 2026-12-31" "$OUT_008_OK/$rf"; then
+    CLAIM_COUNT_008=$((CLAIM_COUNT_008 + 1))
+  fi
+done
+assert_eq "$LEAK_COUNT_008" "0" "008: sentinel licence token never appears in any of the four report files"
+assert_eq "$CLAIM_COUNT_008" "4" "008: decoded owner/expiry claims appear in all four report files"
+
+LEAKY_BIN="$WORK/leaky-pipesure-bin"
+cat > "$LEAKY_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --out) out="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+mkdir -p "$out"
+printf '{"licence":"%s"}\n' "${PIPESURE_LICENCE:-}" > "$out/report.json"
+printf '<html>ok</html>\n' > "$out/report.html"
+printf '{}\n' > "$out/report.sarif"
+printf '# ok\n' > "$out/summary.md"
+EOF
+chmod +x "$LEAKY_BIN"
+
+OUT_008_LEAK="$WORK/out-008-leak"
+set +e
+PIPESURE="$LEAKY_BIN" \
+OUT="$OUT_008_LEAK" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="$SENTINEL_LIC_008" \
+GITHUB_OUTPUT="$WORK/gh_out_008_leak" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_008_LEAK=$?
+set -e
+assert_eq "$RC_008_LEAK" "1" "008: run step fails closed if raw licence token ever reaches a report file"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

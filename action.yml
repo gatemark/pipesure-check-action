@@ -17,7 +17,9 @@ inputs:
       Required. The licence from the shop (ps1.…), from a repository secret:
       `licence: ${{ secrets.PIPESURE_LICENCE }}`. Buy credits at
       https://shop.gatemark.net, redeem them for a licence (POST /v1/redeem),
-      store it as a secret. It downloads the binary and is recorded in the report.
+      store it as a secret. It downloads the binary; only its decoded non-secret
+      claims (owner and expiry) are recorded in the report, never the licence
+      token itself.
     required: true
   token:
     description: >-
@@ -279,7 +281,8 @@ runs:
         ROOT: ${{ inputs.path }}
         OUT: ${{ inputs.output }}
         FAIL_ON: ${{ inputs.fail-on }}
-        # Read by the binary and recorded in the report ("Licensed to <owner> until <date>").
+        # Read by the binary; only decoded non-secret claims ("Licensed to <owner> until <date>")
+        # appear in the report, never the bearer licence token.
         PIPESURE_LICENCE: ${{ inputs.licence }}
       run: |
         set -euo pipefail
@@ -292,4 +295,15 @@ runs:
           eof="PIPESURE_EOF_$(openssl rand -hex 12)"
           printf 'report<<%s\n%s\n%s\n' "$eof" "$OUT/report.json" "$eof" >> "$GITHUB_OUTPUT"
         fi
-        "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON"
+        rc=0
+        "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON" || rc=$?
+        if [ -n "${PIPESURE_LICENCE:-}" ]; then
+          for rf in report.json report.html report.sarif summary.md; do
+            if [ -f "$OUT/$rf" ] && grep -Fq -- "$PIPESURE_LICENCE" "$OUT/$rf"; then
+              rm -f "$OUT/$rf"
+              echo "pipesure: raw licence value detected in $rf; refusing output" >&2
+              exit 1
+            fi
+          done
+        fi
+        exit "$rc"
