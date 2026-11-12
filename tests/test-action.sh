@@ -492,6 +492,43 @@ assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/branch.json" ] && echo yes || echo no )
 assert_eq "$( [ -e "$ERR_OUT_PARTIAL/api/rules.json" ] && echo yes || echo no )" "no" "003: HTTP 500 leaves no rules.json"
 assert_eq "$( [ -f "$ERR_OUT_PARTIAL/api/branch.json.error" ] && grep -q 'HTTP 404' "$ERR_OUT_PARTIAL/api/branch.json.error" && [ -f "$ERR_OUT_PARTIAL/api/rules.json.error" ] && grep -q 'HTTP 500' "$ERR_OUT_PARTIAL/api/rules.json.error" && echo yes || echo no )" "yes" "003: HTTP 404/500 write branch.json.error and rules.json.error"
 
+# --- 005 Regression: licence containing quotes, backslashes or newlines rejected before curl ---
+INJ_ROUTES="$WORK/inj-routes.json"
+cat > "$INJ_ROUTES" <<'EOF'
+{
+  "/injected": {"status": 200, "body": "injected-reached"}
+}
+EOF
+start_server "$INJ_ROUTES" no
+INJ_PORT="$STARTED_PORT"
+INJ_LOG="$STARTED_LOG"
+
+INJ_LICENCE="$(printf 'ps1.abc"\nurl = "http://127.0.0.1:%s/injected"' "$INJ_PORT")"
+run_install_case "/ok" "$INJ_LICENCE" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with quote and newline curl directive exits 2"
+assert_eq "$(wc -l < "$INJ_LOG" | tr -d ' ')" "0" "005: injected curl config URL is never contacted"
+
+run_install_case "/ok" 'ps1.abc"def' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with double quote exits 2"
+
+run_install_case "/ok" 'ps1.abc\def' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with backslash exits 2"
+
+run_install_case "/ok" "ps1.abc def" "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with space exits 2"
+
+run_install_case "/ok" $'ps1.abc\n' "$SHOP_PUB_B64URL"
+assert_eq "$CASE_RC" "2" "005: licence with trailing newline exits 2"
+
+assert_eq "$(python3 -c '
+import re, sys
+txt = open(sys.argv[1], "r", encoding="utf-8").read()
+fence = chr(96) * 3
+blocks = re.findall(fence + r"sh\n(.*?)" + fence, txt, flags=re.S)
+ok = len(blocks) >= 2 and all("[!A-Za-z0-9._-]" in b for b in blocks if "--config -" in b)
+print("yes" if ok else "no")
+' "$ROOT_DIR/README.md")" "yes" "005: README curl --config examples validate key/licence format"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

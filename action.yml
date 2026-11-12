@@ -73,6 +73,11 @@ runs:
           echo "pipesure: a licence is required: buy credits at $PIPESURE_SHOP, redeem them for a licence (POST /v1/redeem), store it as the secret PIPESURE_LICENCE and pass it to this step" >&2
           exit 2
         fi
+        valid_licence() { local LC_ALL=C; case "$1" in ""|*[!A-Za-z0-9._-]*) return 1 ;; esac; }
+        if ! valid_licence "$PIPESURE_LICENCE"; then
+          echo "pipesure: the licence contains invalid characters (expected only A-Za-z0-9._-)" >&2
+          exit 2
+        fi
         if [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
           echo "pipesure: no key is pinned in this version of the install step, so a download cannot be verified; use a released version" >&2
           exit 2
