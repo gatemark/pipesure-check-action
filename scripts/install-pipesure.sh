@@ -13,10 +13,29 @@
 # else printed as ADO logging commands.
 
 set -euo pipefail
+no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) target=x86_64-unknown-linux-musl ;;
   Linux-aarch64|Linux-arm64) target=aarch64-unknown-linux-musl ;;
-  Darwin-arm64) target=aarch64-apple-darwin ;;
+  Darwin-arm64)
+    target=aarch64-apple-darwin
+    for brew_ssl in "${HOMEBREW_PREFIX:-}/opt/openssl@3/bin" /opt/homebrew/opt/openssl@3/bin /usr/local/opt/openssl@3/bin; do
+      if [ -n "${brew_ssl%/opt/openssl@3/bin}" ] && no_ctl "$brew_ssl" && [ -x "$brew_ssl/openssl" ]; then
+        PATH="$brew_ssl:$PATH"
+        export PATH
+        if [ -n "${GITHUB_PATH:-}" ]; then
+          printf '%s\n' "$brew_ssl" >> "$GITHUB_PATH"
+        fi
+        break
+      fi
+    done
+    case "$(openssl version 2>/dev/null || true)" in
+      LibreSSL*|"")
+        echo "pipesure: macOS arm64 requires OpenSSL 1.1.1+ with Ed25519 (install Homebrew openssl@3)" >&2
+        exit 2
+        ;;
+    esac
+    ;;
   *) echo "pipesure: no binary for $(uname -s) $(uname -m) (Linux x86_64 or arm64, macOS arm64; Windows x64 uses the PowerShell step)" >&2; exit 2 ;;
 esac
 if [ -z "${PIPESURE_LICENCE:-}" ]; then
@@ -33,7 +52,6 @@ if [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]
   exit 2
 fi
 case "$PIPESURE_SHOP" in https://*) ;; *) echo "pipesure: the shop address must be https" >&2; exit 2 ;; esac
-no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
 if [ -z "${PIPESURE_TMP:-}" ] || ! no_ctl "$PIPESURE_TMP"; then
   echo "pipesure: PIPESURE_TMP must be non-empty and must not contain control characters" >&2
   exit 2

@@ -960,6 +960,126 @@ assert_eq "$RC_009_RUN" "1" "009: run step refuses swapped binary with exit 1"
 assert_eq "$RC_009_STEP1" "1" "009: settings step refuses swapped binary with exit 1"
 assert_eq "$( [ -e "$TAMPER_MARKER" ] && echo yes || echo no )" "no" "009: swapped binary is never executed in later steps"
 
+# --- 010 Regression: Darwin-arm64 locates Homebrew openssl@3 (or fails pre-download on LibreSSL) and docs match ---
+DARWIN_MANIFEST="{\"sha256\":\"$PAYLOAD_SHA\",\"version\":\"v0.4.0\",\"target\":\"aarch64-apple-darwin\",\"download\":\"dl_darwin010\"}"
+{
+  IFS= read -r DARWIN_M64
+  IFS= read -r DARWIN_SIG
+} < <(sign_manifest "$DARWIN_MANIFEST" "$KEYS_DIR/shop.key.pem")
+
+SHOP_010_ROUTES="$WORK/shop-010-routes.json"
+python3 -c '
+import json, sys
+p_bin, dm, ds, out = sys.argv[1:5]
+routes = {
+    "/darwin/v1/dl/pipesure-check/v0.4.0/aarch64-apple-darwin": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dm, "X-Pipesure-Manifest-Sig": ds}
+    },
+    "/darwin-nobrew/v1/dl/pipesure-check/v0.4.0/aarch64-apple-darwin": {
+        "status": 200, "body_file": p_bin,
+        "headers": {"X-Pipesure-Manifest": dm, "X-Pipesure-Manifest-Sig": ds}
+    },
+}
+with open(out, "w", encoding="utf-8") as f:
+    json.dump(routes, f)
+' "$PAYLOAD_BIN" "$DARWIN_M64" "$DARWIN_SIG" "$SHOP_010_ROUTES"
+
+start_server "$SHOP_010_ROUTES" tls
+SHOP_010_PORT="$STARTED_PORT"
+SHOP_010_LOG="$STARTED_LOG"
+
+REAL_OPENSSL="$(command -v openssl)"
+FAKE_DARWIN_BIN="$WORK/fake-darwin-bin"
+FAKE_BREW="$WORK/fake-homebrew"
+mkdir -p "$FAKE_DARWIN_BIN" "$FAKE_BREW/opt/openssl@3/bin"
+ln -s "$REAL_OPENSSL" "$FAKE_BREW/opt/openssl@3/bin/openssl"
+
+cat > "$FAKE_DARWIN_BIN/uname" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -s) echo Darwin ;;
+  -m) echo arm64 ;;
+  *) echo "Darwin arm64" ;;
+esac
+EOF
+cat > "$FAKE_DARWIN_BIN/openssl" <<EOF
+#!/usr/bin/env bash
+if [ "\${1:-}" = "version" ]; then
+  echo "LibreSSL 3.3.6"
+  exit 0
+fi
+for arg in "\$@"; do
+  if [ "\$arg" = "-rawin" ]; then
+    echo "pkeyutl: Unknown option: -rawin" >&2
+    exit 1
+  fi
+done
+exec "$REAL_OPENSSL" "\$@"
+EOF
+chmod +x "$FAKE_DARWIN_BIN/uname" "$FAKE_DARWIN_BIN/openssl"
+
+DARWIN_OK_DIR="$WORK/darwin-ok"
+mkdir -p "$DARWIN_OK_DIR"
+: > "$DARWIN_OK_DIR/gh_env"
+: > "$DARWIN_OK_DIR/gh_out"
+: > "$DARWIN_OK_DIR/gh_path"
+set +e
+PATH="$FAKE_DARWIN_BIN:$PATH" \
+HOMEBREW_PREFIX="$FAKE_BREW" \
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$DARWIN_OK_DIR/tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_010_PORT}/darwin" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$DARWIN_OK_DIR/gh_env" \
+GITHUB_OUTPUT="$DARWIN_OK_DIR/gh_out" \
+GITHUB_PATH="$DARWIN_OK_DIR/gh_path" \
+bash "$WORK/step-0.sh" >"$DARWIN_OK_DIR/stdout" 2>"$DARWIN_OK_DIR/stderr"
+RC_010_INSTALL=$?
+
+RC_010_RUN=99
+if [ "$RC_010_INSTALL" -eq 0 ]; then
+  (
+    eval "$(load_github_env "$DARWIN_OK_DIR/gh_env")"
+    PATH="$FAKE_DARWIN_BIN:$PATH" \
+    HOMEBREW_PREFIX="$FAKE_BREW" \
+    PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+    OUT="$DARWIN_OK_DIR/report" \
+    ROOT="$SAMPLE_REPO" \
+    FAIL_ON="" \
+    PIPESURE_LICENCE="ps1.test_lic" \
+    GITHUB_OUTPUT="$DARWIN_OK_DIR/gh_out_run" \
+    bash "$WORK/step-2.sh" >/dev/null 2>&1
+  )
+  RC_010_RUN=$?
+fi
+
+DARWIN_NOBREW_DIR="$WORK/darwin-nobrew"
+mkdir -p "$DARWIN_NOBREW_DIR"
+: > "$DARWIN_NOBREW_DIR/gh_env"
+: > "$DARWIN_NOBREW_DIR/gh_out"
+PATH="$FAKE_DARWIN_BIN:$PATH" \
+HOMEBREW_PREFIX="$WORK/nonexistent-brew" \
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$DARWIN_NOBREW_DIR/tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_010_PORT}/darwin-nobrew" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$DARWIN_NOBREW_DIR/gh_env" \
+GITHUB_OUTPUT="$DARWIN_NOBREW_DIR/gh_out" \
+bash "$WORK/step-0.sh" >"$DARWIN_NOBREW_DIR/stdout" 2>"$DARWIN_NOBREW_DIR/stderr"
+RC_010_NOBREW=$?
+set -e
+
+assert_eq "$RC_010_INSTALL" "0" "010: Darwin-arm64 locates Homebrew openssl@3 and verifies Ed25519 manifest"
+assert_eq "$RC_010_RUN" "0" "010: Darwin-arm64 run step re-verifies manifest via Homebrew openssl@3"
+assert_eq "$RC_010_NOBREW" "2" "010: Darwin-arm64 with only LibreSSL exits 2 cleanly"
+assert_eq "$(grep -c 'darwin-nobrew' "$SHOP_010_LOG" || true)" "0" "010: Darwin-arm64 LibreSSL prerequisite check refuses before contacting shop"
+assert_eq "$(grep -qi 'openssl@3' "$ROOT_DIR/README.md" && grep -qi 'macOS arm64' "$ROOT_DIR/README.md" && echo yes || echo no)" "yes" "010: README documents macOS arm64 runner support and Homebrew openssl@3 requirement"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

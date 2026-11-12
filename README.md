@@ -70,7 +70,7 @@ Every copy the shop serves is stamped with a download id (the report and `pipesu
 
 ## Other runners
 
-Linux x86_64 and arm64 runners are supported by this Action. ADO pipelines use the steps template in the Pipesure Check documentation (bash and PowerShell steps, the same download and verification). A macOS arm64 engineer's laptop can download with the same licence:
+Linux x86_64, Linux arm64 and macOS arm64 runners are supported by this Action (on macOS arm64, Homebrew `openssl@3` is required for Ed25519 manifest verification — pre-installed on GitHub-hosted `macos-14` and later runners and added to `PATH` automatically). ADO pipelines use the steps template in the Pipesure Check documentation (bash and PowerShell steps, the same download and verification). A macOS arm64 engineer's laptop can also download manually with the same licence:
 
 ```sh
 case "${PIPESURE_LICENCE:-}" in ""|*[!A-Za-z0-9._-]*) echo "invalid licence" >&2; exit 2 ;; esac
