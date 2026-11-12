@@ -8,8 +8,9 @@
 #   PIPESURE_VERSION     the release to install, v0.4.0
 #   PIPESURE_PUBLIC_KEY  the shop's Ed25519 public key (43 base64url characters) that signs the manifest
 #   PIPESURE_TMP         a scratch folder (RUNNER_TEMP or Agent.TempDirectory)
-# Outputs: PIPESURE (the binary) and PIPESURE_DOWNLOAD (the download id) are written to
-# $GITHUB_ENV (and download to $GITHUB_OUTPUT) when set, else printed as ADO logging commands.
+# Outputs: PIPESURE (the binary), PIPESURE_DOWNLOAD (the download id) and PIPESURE_SHA256
+# (the verified digest) are written to $GITHUB_ENV (and download to $GITHUB_OUTPUT) when set,
+# else printed as ADO logging commands.
 
 set -euo pipefail
 case "$(uname -s)-$(uname -m)" in
@@ -38,7 +39,12 @@ if [ -z "${PIPESURE_TMP:-}" ] || ! no_ctl "$PIPESURE_TMP"; then
   exit 2
 fi
 tmp="$PIPESURE_TMP/pipesure-dl"
-mkdir -p "$tmp"
+if [ -L "$tmp" ]; then
+  echo "pipesure: download directory must not be a symlink" >&2
+  exit 1
+fi
+( umask 077 && mkdir -p "$tmp" )
+chmod 700 "$tmp"
 bin="$tmp/pipesure"
 rm -f "$bin"
 # The licence reaches curl through its configuration on stdin: it is never an argument.
@@ -118,6 +124,7 @@ if [ "$version" != "$PIPESURE_VERSION" ] || [ "$mtarget" != "$target" ]; then
   exit 1
 fi
 case "$sha" in *[!0-9a-f]*|"") echo "pipesure: the manifest carries no digest" >&2; exit 1 ;; esac
+if [ "${#sha}" -ne 64 ]; then echo "pipesure: the manifest carries an invalid SHA-256 digest" >&2; exit 1; fi
 if command -v sha256sum >/dev/null; then
   echo "$sha  $bin" | sha256sum --check --strict --quiet
 else
@@ -125,17 +132,19 @@ else
   if [ "$actual" != "$sha" ]; then echo "pipesure: the file does not match the manifest's SHA-256" >&2; exit 1; fi
 fi
 case "$download" in *[!A-Za-z0-9_-]*|"") download=unknown ;; esac
-chmod +x "$bin"
+chmod 700 "$bin"
 echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
 if [ -n "${GITHUB_ENV:-}" ]; then
   eof="PIPESURE_EOF_$(openssl rand -hex 12)"
   {
     printf 'PIPESURE<<%s\n%s\n%s\n' "$eof" "$bin" "$eof"
     printf 'PIPESURE_DOWNLOAD<<%s\n%s\n%s\n' "$eof" "$download" "$eof"
+    printf 'PIPESURE_SHA256<<%s\n%s\n%s\n' "$eof" "$sha" "$eof"
   } >> "$GITHUB_ENV"
 else
   echo "##vso[task.setvariable variable=PIPESURE]$bin"
   echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
+  echo "##vso[task.setvariable variable=PIPESURE_SHA256]$sha"
 fi
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   eof="PIPESURE_EOF_$(openssl rand -hex 12)"

@@ -91,7 +91,12 @@ runs:
           exit 2
         fi
         tmp="$PIPESURE_TMP/pipesure-dl"
-        mkdir -p "$tmp"
+        if [ -L "$tmp" ]; then
+          echo "pipesure: download directory must not be a symlink" >&2
+          exit 1
+        fi
+        ( umask 077 && mkdir -p "$tmp" )
+        chmod 700 "$tmp"
         bin="$tmp/pipesure"
         rm -f "$bin"
         # The licence reaches curl through its configuration on stdin: it is never an argument.
@@ -171,6 +176,7 @@ runs:
           exit 1
         fi
         case "$sha" in *[!0-9a-f]*|"") echo "pipesure: the manifest carries no digest" >&2; exit 1 ;; esac
+        if [ "${#sha}" -ne 64 ]; then echo "pipesure: the manifest carries an invalid SHA-256 digest" >&2; exit 1; fi
         if command -v sha256sum >/dev/null; then
           echo "$sha  $bin" | sha256sum --check --strict --quiet
         else
@@ -178,17 +184,19 @@ runs:
           if [ "$actual" != "$sha" ]; then echo "pipesure: the file does not match the manifest's SHA-256" >&2; exit 1; fi
         fi
         case "$download" in *[!A-Za-z0-9_-]*|"") download=unknown ;; esac
-        chmod +x "$bin"
+        chmod 700 "$bin"
         echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
         if [ -n "${GITHUB_ENV:-}" ]; then
           eof="PIPESURE_EOF_$(openssl rand -hex 12)"
           {
             printf 'PIPESURE<<%s\n%s\n%s\n' "$eof" "$bin" "$eof"
             printf 'PIPESURE_DOWNLOAD<<%s\n%s\n%s\n' "$eof" "$download" "$eof"
+            printf 'PIPESURE_SHA256<<%s\n%s\n%s\n' "$eof" "$sha" "$eof"
           } >> "$GITHUB_ENV"
         else
           echo "##vso[task.setvariable variable=PIPESURE]$bin"
           echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
+          echo "##vso[task.setvariable variable=PIPESURE_SHA256]$sha"
         fi
         if [ -n "${GITHUB_OUTPUT:-}" ]; then
           eof="PIPESURE_EOF_$(openssl rand -hex 12)"
@@ -201,6 +209,7 @@ runs:
         GH_TOKEN: ${{ inputs.token }}
         OUT: ${{ inputs.output }}
         ROOT: ${{ inputs.path }}
+        PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
       run: |
         set -uo pipefail
         no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
@@ -208,6 +217,80 @@ runs:
           echo "pipesure: path and output inputs must be non-empty and must not contain control characters" >&2
           exit 2
         fi
+        verify_pipesure() {
+          if [ -z "${PIPESURE:-}" ] || [ ! -f "$PIPESURE" ] || [ -L "$PIPESURE" ]; then
+            echo "pipesure: verified binary is missing or a symlink; refusing to run" >&2
+            exit 1
+          fi
+          case "${PIPESURE_SHA256:-}" in
+            *[!0-9a-f]*|"") echo "pipesure: missing verified binary digest; refusing to run" >&2; exit 1 ;;
+          esac
+          if [ "${#PIPESURE_SHA256}" -ne 64 ]; then
+            echo "pipesure: invalid verified binary digest; refusing to run" >&2
+            exit 1
+          fi
+          local dir actual msha vtmp verdict
+          dir="$(dirname "$PIPESURE")"
+          if [ -f "$dir/manifest.msg" ] || [ -f "$dir/manifest.sig" ]; then
+            if [ -z "${PIPESURE_PUBLIC_KEY:-}" ] || [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
+              echo "pipesure: missing pinned key for manifest re-verification; refusing to run" >&2
+              exit 1
+            fi
+            if [ ! -f "$dir/manifest.msg" ] || [ ! -f "$dir/manifest.sig" ] || [ -L "$dir/manifest.msg" ] || [ -L "$dir/manifest.sig" ]; then
+              echo "pipesure: signed manifest missing or symlinked; refusing to run" >&2
+              exit 1
+            fi
+            vtmp="$(mktemp -d "$dir/verify.XXXXXX")"
+            b64url() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac; printf '%s' "$s" | base64 -d; }
+            { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; b64url "$PIPESURE_PUBLIC_KEY"; } > "$vtmp/key.der"
+            if ! openssl pkey -pubin -inform DER -in "$vtmp/key.der" -out "$vtmp/key.pem" 2>/dev/null || \
+               ! verdict="$(openssl pkeyutl -verify -pubin -inkey "$vtmp/key.pem" -rawin -in "$dir/manifest.msg" -sigfile "$dir/manifest.sig" 2>/dev/null)"; then
+              rm -rf "$vtmp"
+              echo "pipesure: manifest signature re-verification failed; refusing to run" >&2
+              exit 1
+            fi
+            case "$verdict" in
+              *"Verified Successfully"*) ;;
+              *) rm -rf "$vtmp"; echo "pipesure: manifest signature did not verify; refusing to run" >&2; exit 1 ;;
+            esac
+            msha="$(python3 -c '
+        import base64, json, sys
+        msg = open(sys.argv[1], "r", encoding="ascii").read()
+        if not msg.startswith("psm1."):
+            sys.exit(1)
+        b64 = msg[5:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        raw = base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8")
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("dup")
+                d[k] = v
+            return d
+        obj = json.loads(raw, object_pairs_hook=no_dups)
+        print(obj["sha256"])
+        ' "$dir/manifest.msg" 2>/dev/null)" || { rm -rf "$vtmp"; echo "pipesure: signed manifest parse failed; refusing to run" >&2; exit 1; }
+            rm -rf "$vtmp"
+            if [ "$msha" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary digest does not match signed manifest; refusing to run" >&2
+              exit 1
+            fi
+          fi
+          if command -v sha256sum >/dev/null; then
+            if ! echo "$PIPESURE_SHA256  $PIPESURE" | sha256sum --check --strict --quiet >/dev/null 2>&1; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          else
+            actual="$(shasum -a 256 "$PIPESURE" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          fi
+        }
+        verify_pipesure
         mkdir -p "$OUT/api"
         # The files checked in at the scanned commit, for PH-16's proof. No list, no proof.
         git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
@@ -284,6 +367,7 @@ runs:
         # Read by the binary; only decoded non-secret claims ("Licensed to <owner> until <date>")
         # appear in the report, never the bearer licence token.
         PIPESURE_LICENCE: ${{ inputs.licence }}
+        PIPESURE_PUBLIC_KEY: CwUFleBFq9ExHsy-9FkTkVPVJT29OIQAr2z7dat1PY0
       run: |
         set -euo pipefail
         no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
@@ -291,6 +375,80 @@ runs:
           echo "pipesure: action inputs must not contain control characters" >&2
           exit 2
         fi
+        verify_pipesure() {
+          if [ -z "${PIPESURE:-}" ] || [ ! -f "$PIPESURE" ] || [ -L "$PIPESURE" ]; then
+            echo "pipesure: verified binary is missing or a symlink; refusing to run" >&2
+            exit 1
+          fi
+          case "${PIPESURE_SHA256:-}" in
+            *[!0-9a-f]*|"") echo "pipesure: missing verified binary digest; refusing to run" >&2; exit 1 ;;
+          esac
+          if [ "${#PIPESURE_SHA256}" -ne 64 ]; then
+            echo "pipesure: invalid verified binary digest; refusing to run" >&2
+            exit 1
+          fi
+          local dir actual msha vtmp verdict
+          dir="$(dirname "$PIPESURE")"
+          if [ -f "$dir/manifest.msg" ] || [ -f "$dir/manifest.sig" ]; then
+            if [ -z "${PIPESURE_PUBLIC_KEY:-}" ] || [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]; then
+              echo "pipesure: missing pinned key for manifest re-verification; refusing to run" >&2
+              exit 1
+            fi
+            if [ ! -f "$dir/manifest.msg" ] || [ ! -f "$dir/manifest.sig" ] || [ -L "$dir/manifest.msg" ] || [ -L "$dir/manifest.sig" ]; then
+              echo "pipesure: signed manifest missing or symlinked; refusing to run" >&2
+              exit 1
+            fi
+            vtmp="$(mktemp -d "$dir/verify.XXXXXX")"
+            b64url() { local s="${1//-/+}"; s="${s//_//}"; case $(( ${#s} % 4 )) in 2) s="$s==" ;; 3) s="$s=" ;; esac; printf '%s' "$s" | base64 -d; }
+            { printf '\060\052\060\005\006\003\053\145\160\003\041\000'; b64url "$PIPESURE_PUBLIC_KEY"; } > "$vtmp/key.der"
+            if ! openssl pkey -pubin -inform DER -in "$vtmp/key.der" -out "$vtmp/key.pem" 2>/dev/null || \
+               ! verdict="$(openssl pkeyutl -verify -pubin -inkey "$vtmp/key.pem" -rawin -in "$dir/manifest.msg" -sigfile "$dir/manifest.sig" 2>/dev/null)"; then
+              rm -rf "$vtmp"
+              echo "pipesure: manifest signature re-verification failed; refusing to run" >&2
+              exit 1
+            fi
+            case "$verdict" in
+              *"Verified Successfully"*) ;;
+              *) rm -rf "$vtmp"; echo "pipesure: manifest signature did not verify; refusing to run" >&2; exit 1 ;;
+            esac
+            msha="$(python3 -c '
+        import base64, json, sys
+        msg = open(sys.argv[1], "r", encoding="ascii").read()
+        if not msg.startswith("psm1."):
+            sys.exit(1)
+        b64 = msg[5:]
+        b64 += "=" * ((4 - len(b64) % 4) % 4)
+        raw = base64.urlsafe_b64decode(b64.encode("ascii")).decode("utf-8")
+        def no_dups(pairs):
+            d = {}
+            for k, v in pairs:
+                if k in d:
+                    raise ValueError("dup")
+                d[k] = v
+            return d
+        obj = json.loads(raw, object_pairs_hook=no_dups)
+        print(obj["sha256"])
+        ' "$dir/manifest.msg" 2>/dev/null)" || { rm -rf "$vtmp"; echo "pipesure: signed manifest parse failed; refusing to run" >&2; exit 1; }
+            rm -rf "$vtmp"
+            if [ "$msha" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary digest does not match signed manifest; refusing to run" >&2
+              exit 1
+            fi
+          fi
+          if command -v sha256sum >/dev/null; then
+            if ! echo "$PIPESURE_SHA256  $PIPESURE" | sha256sum --check --strict --quiet >/dev/null 2>&1; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          else
+            actual="$(shasum -a 256 "$PIPESURE" | cut -d ' ' -f 1)"
+            if [ "$actual" != "$PIPESURE_SHA256" ]; then
+              echo "pipesure: binary SHA-256 mismatch before execution; refusing to run" >&2
+              exit 1
+            fi
+          fi
+        }
+        verify_pipesure
         if [ -n "${GITHUB_OUTPUT:-}" ]; then
           eof="PIPESURE_EOF_$(openssl rand -hex 12)"
           printf 'report<<%s\n%s\n%s\n' "$eof" "$OUT/report.json" "$eof" >> "$GITHUB_OUTPUT"

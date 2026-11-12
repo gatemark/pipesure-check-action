@@ -362,16 +362,21 @@ git -C "$SAMPLE_REPO" commit -q -m "init"
 
 (
   eval "$(load_github_env "$CASE_DIR/gh_env")"
-  export PIPESURE_EXEC_MARKER="$CASE_DIR/executed"
-  export GH_TOKEN="tok_test001"
-  export OUT="$CASE_DIR/report-out"
-  export ROOT="$SAMPLE_REPO"
-  export GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}"
-  export GITHUB_REPOSITORY="octo/demo"
-  export FAIL_ON=""
-  export PIPESURE_LICENCE="ps1.test_lic"
-  export GITHUB_OUTPUT="$CASE_DIR/gh_out_run"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  PIPESURE_EXEC_MARKER="$CASE_DIR/executed" \
+  GH_TOKEN="tok_test001" \
+  OUT="$CASE_DIR/report-out" \
+  ROOT="$SAMPLE_REPO" \
+  GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+  GITHUB_REPOSITORY="octo/demo" \
   bash "$WORK/step-1.sh"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  PIPESURE_EXEC_MARKER="$CASE_DIR/executed" \
+  OUT="$CASE_DIR/report-out" \
+  ROOT="$SAMPLE_REPO" \
+  FAIL_ON="" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  GITHUB_OUTPUT="$CASE_DIR/gh_out_run" \
   bash "$WORK/step-2.sh"
 )
 if [ -f "$CASE_DIR/report-out/report.json" ] && [ -f "$CASE_DIR/report-out/api/files.txt" ]; then
@@ -461,6 +466,7 @@ API_ERR_PORT="$STARTED_PORT"
 
 ERR_OUT_403="$WORK/out-003-403"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 GH_TOKEN="tok_test003" \
 OUT="$ERR_OUT_403" \
 ROOT="$SAMPLE_REPO" \
@@ -469,6 +475,7 @@ GITHUB_REPOSITORY="octo/forbidden" \
 bash "$WORK/step-1.sh" 2>"$WORK/step1-003.err"
 
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 OUT="$ERR_OUT_403" \
 ROOT="$SAMPLE_REPO" \
 FAIL_ON="" \
@@ -481,6 +488,7 @@ assert_eq "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(
 
 ERR_OUT_PARTIAL="$WORK/out-003-partial"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 GH_TOKEN="tok_test003" \
 OUT="$ERR_OUT_PARTIAL" \
 ROOT="$SAMPLE_REPO" \
@@ -577,6 +585,7 @@ SAMPLER_PID=$!
 
 OUT_002="$WORK/out-002"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 GH_TOKEN="$SENTINEL_GH_TOKEN" \
 OUT="$OUT_002" \
 ROOT="$SAMPLE_REPO" \
@@ -591,6 +600,7 @@ assert_eq "$( [ -f "$OUT_002/api/repo.json" ] && grep -q "\"authorization\": \"B
 OUT_002_BAD="$WORK/out-002-bad"
 INJ_GH_TOKEN="$(printf 'tok_bad"\nurl = "http://127.0.0.1:%s/injected"' "$INJ_PORT")"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 GH_TOKEN="$INJ_GH_TOKEN" \
 OUT="$OUT_002_BAD" \
 ROOT="$SAMPLE_REPO" \
@@ -623,6 +633,7 @@ API_BRANCH_LOG="$STARTED_LOG"
 
 OUT_004_RAW="$WORK/out-004-raw"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 GH_TOKEN="tok_test004" \
 OUT="$OUT_004_RAW" \
 ROOT="$SAMPLE_REPO" \
@@ -648,9 +659,11 @@ fi
 exit 2
 EOF
 chmod +x "$PREENC_BIN"
+PREENC_SHA="$(sha256sum "$PREENC_BIN" | cut -d ' ' -f 1)"
 
 OUT_004_PRE="$WORK/out-004-pre"
 PIPESURE="$PREENC_BIN" \
+PIPESURE_SHA256="$PREENC_SHA" \
 GH_TOKEN="tok_test004" \
 OUT="$OUT_004_PRE" \
 ROOT="$SAMPLE_REPO" \
@@ -661,12 +674,13 @@ assert_eq "$( [ -f "$OUT_004_PRE/api/branch.json" ] && [ -f "$OUT_004_PRE/api/ru
 
 # --- 006 Regression: GITHUB_ENV and GITHUB_OUTPUT use heredoc delimiters and reject control chars ---
 run_install_case "/ok" "ps1.test_lic" "$SHOP_PUB_B64URL"
-assert_eq "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_env" || true)" "2" "006: install step writes PIPESURE and PIPESURE_DOWNLOAD with heredoc delimiters"
+assert_eq "$( [ "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_env" || true)" -ge 2 ] && echo yes || echo no )" "yes" "006: install step writes GITHUB_ENV variables with heredoc delimiters"
 assert_eq "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_out" || true)" "1" "006: install step writes download output with heredoc delimiter"
 
 GH_OUT_006_OK="$WORK/gh_out_006_ok"
 : > "$GH_OUT_006_OK"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 OUT="$WORK/out-006-ok" \
 ROOT="$SAMPLE_REPO" \
 FAIL_ON="" \
@@ -831,6 +845,7 @@ print("yes" if ok else "no")
 SENTINEL_LIC_008="ps1.sentinel_008"
 OUT_008_OK="$WORK/out-008-ok"
 PIPESURE="$PAYLOAD_BIN" \
+PIPESURE_SHA256="$PAYLOAD_SHA" \
 OUT="$OUT_008_OK" \
 ROOT="$SAMPLE_REPO" \
 FAIL_ON="" \
@@ -869,10 +884,12 @@ printf '{}\n' > "$out/report.sarif"
 printf '# ok\n' > "$out/summary.md"
 EOF
 chmod +x "$LEAKY_BIN"
+LEAKY_SHA="$(sha256sum "$LEAKY_BIN" | cut -d ' ' -f 1)"
 
 OUT_008_LEAK="$WORK/out-008-leak"
 set +e
 PIPESURE="$LEAKY_BIN" \
+PIPESURE_SHA256="$LEAKY_SHA" \
 OUT="$OUT_008_LEAK" \
 ROOT="$SAMPLE_REPO" \
 FAIL_ON="" \
@@ -882,6 +899,66 @@ bash "$WORK/step-2.sh" 2>/dev/null
 RC_008_LEAK=$?
 set -e
 assert_eq "$RC_008_LEAK" "1" "008: run step fails closed if raw licence token ever reaches a report file"
+
+# --- 009 Regression: 0700 permissions and binary SHA-256 + signed-manifest re-verification before execution ---
+PERM_BASE="/dev/shm"
+if [ ! -d "$PERM_BASE" ] || [ ! -w "$PERM_BASE" ]; then
+  PERM_BASE="/tmp"
+fi
+PERM_TMP_009="$(mktemp -d "$PERM_BASE/pipesure-009.XXXXXX")"
+: > "$WORK/gh_env_009"
+: > "$WORK/gh_out_009_inst"
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$PERM_TMP_009" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_PORT}/ok" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$WORK/gh_env_009" \
+GITHUB_OUTPUT="$WORK/gh_out_009_inst" \
+bash "$WORK/step-0.sh" >/dev/null 2>&1
+
+DL_DIR_009="$PERM_TMP_009/pipesure-dl"
+assert_eq "$(stat -c '%a' "$DL_DIR_009")" "700" "009: pipesure-dl directory permissions are 0700"
+assert_eq "$(stat -c '%a' "$DL_DIR_009/pipesure")" "700" "009: verified binary permissions are 0700"
+
+TAMPER_MARKER="$WORK/tamper-executed-009"
+rm -f "$TAMPER_MARKER"
+cat > "$DL_DIR_009/pipesure" <<EOF
+#!/usr/bin/env bash
+printf 'swapped\n' >> "$TAMPER_MARKER"
+exit 0
+EOF
+chmod 700 "$DL_DIR_009/pipesure"
+
+set +e
+(
+  eval "$(load_github_env "$WORK/gh_env_009")"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  OUT="$WORK/out-009-run" \
+  ROOT="$SAMPLE_REPO" \
+  FAIL_ON="" \
+  PIPESURE_LICENCE="ps1.test_lic" \
+  GITHUB_OUTPUT="$WORK/gh_out_009" \
+  bash "$WORK/step-2.sh" 2>/dev/null
+)
+RC_009_RUN=$?
+(
+  eval "$(load_github_env "$WORK/gh_env_009")"
+  PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+  GH_TOKEN="tok_test009" \
+  OUT="$WORK/out-009-step1" \
+  ROOT="$SAMPLE_REPO" \
+  GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+  GITHUB_REPOSITORY="octo/demo" \
+  bash "$WORK/step-1.sh" 2>/dev/null
+)
+RC_009_STEP1=$?
+set -e
+rm -rf "$PERM_TMP_009"
+assert_eq "$RC_009_RUN" "1" "009: run step refuses swapped binary with exit 1"
+assert_eq "$RC_009_STEP1" "1" "009: settings step refuses swapped binary with exit 1"
+assert_eq "$( [ -e "$TAMPER_MARKER" ] && echo yes || echo no )" "no" "009: swapped binary is never executed in later steps"
 
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
