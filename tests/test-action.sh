@@ -659,6 +659,66 @@ GITHUB_REPOSITORY="octo/weird-branch" \
 bash "$WORK/step-1.sh" 2>/dev/null
 assert_eq "$( [ -f "$OUT_004_PRE/api/branch.json" ] && [ -f "$OUT_004_PRE/api/rules.json" ] && echo yes || echo no )" "yes" "004: pre-encoded default-branch output is not double-encoded"
 
+# --- 006 Regression: GITHUB_ENV and GITHUB_OUTPUT use heredoc delimiters and reject control chars ---
+run_install_case "/ok" "ps1.test_lic" "$SHOP_PUB_B64URL"
+assert_eq "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_env" || true)" "2" "006: install step writes PIPESURE and PIPESURE_DOWNLOAD with heredoc delimiters"
+assert_eq "$(grep -c '<<PIPESURE_EOF_' "$CASE_DIR/gh_out" || true)" "1" "006: install step writes download output with heredoc delimiter"
+
+GH_OUT_006_OK="$WORK/gh_out_006_ok"
+: > "$GH_OUT_006_OK"
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$WORK/out-006-ok" \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_OK" \
+bash "$WORK/step-2.sh"
+assert_eq "$(grep -c '<<PIPESURE_EOF_' "$GH_OUT_006_OK" || true)" "1" "006: run step writes report output with heredoc delimiter"
+
+GH_OUT_006_BAD="$WORK/gh_out_006_bad"
+: > "$GH_OUT_006_BAD"
+set +e
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$WORK/pipesure-report"$'\ninjected=evil' \
+ROOT="$SAMPLE_REPO" \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_006_OUT=$?
+PIPESURE="$PAYLOAD_BIN" \
+OUT="$WORK/out-006-badroot" \
+ROOT=$'.\ninjected=evil' \
+FAIL_ON="" \
+PIPESURE_LICENCE="ps1.test_lic" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-2.sh" 2>/dev/null
+RC_006_ROOT=$?
+PIPESURE="$PAYLOAD_BIN" \
+GH_TOKEN="tok_test006" \
+OUT="$WORK/pipesure-report"$'\ninjected=evil' \
+ROOT="$SAMPLE_REPO" \
+GITHUB_API_URL="http://127.0.0.1:${API_OK_PORT}" \
+GITHUB_REPOSITORY="octo/demo" \
+bash "$WORK/step-1.sh" 2>/dev/null
+RC_006_STEP1=$?
+CURL_CA_BUNDLE="$KEYS_DIR/tls.cert.pem" \
+PIPESURE_LICENCE="ps1.test_lic" \
+PIPESURE_TMP="$WORK/bad"$'\n'"tmp" \
+PIPESURE_SHOP="https://127.0.0.1:${SHOP_PORT}/ok" \
+PIPESURE_VERSION="v0.4.0" \
+PIPESURE_PUBLIC_KEY="$SHOP_PUB_B64URL" \
+GITHUB_ENV="$WORK/gh_env_006_bad" \
+GITHUB_OUTPUT="$GH_OUT_006_BAD" \
+bash "$WORK/step-0.sh" >/dev/null 2>&1
+RC_006_TMP=$?
+set -e
+assert_eq "$RC_006_OUT" "2" "006: multi-line inputs.output rejected in run step with exit 2"
+assert_eq "$RC_006_ROOT" "2" "006: multi-line inputs.path rejected in run step with exit 2"
+assert_eq "$RC_006_STEP1" "2" "006: multi-line inputs.output rejected in settings step with exit 2"
+assert_eq "$RC_006_TMP" "2" "006: multi-line PIPESURE_TMP rejected in install step with exit 2"
+assert_eq "$(wc -l < "$GH_OUT_006_BAD" | tr -d ' ')" "0" "006: rejected multi-line inputs leave GITHUB_OUTPUT untouched"
+
 printf '\nSummary: pass=%d fail=%d\n' "$PASS" "$FAIL"
 if [ "$FAIL" -ne 0 ]; then
   exit 1

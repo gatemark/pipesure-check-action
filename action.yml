@@ -83,6 +83,11 @@ runs:
           exit 2
         fi
         case "$PIPESURE_SHOP" in https://*) ;; *) echo "pipesure: the shop address must be https" >&2; exit 2 ;; esac
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+        if [ -z "${PIPESURE_TMP:-}" ] || ! no_ctl "$PIPESURE_TMP"; then
+          echo "pipesure: PIPESURE_TMP must be non-empty and must not contain control characters" >&2
+          exit 2
+        fi
         tmp="$PIPESURE_TMP/pipesure-dl"
         mkdir -p "$tmp"
         bin="$tmp/pipesure"
@@ -136,13 +141,18 @@ runs:
         chmod +x "$bin"
         echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
         if [ -n "${GITHUB_ENV:-}" ]; then
-          printf 'PIPESURE=%s\nPIPESURE_DOWNLOAD=%s\n' "$bin" "$download" >> "$GITHUB_ENV"
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          {
+            printf 'PIPESURE<<%s\n%s\n%s\n' "$eof" "$bin" "$eof"
+            printf 'PIPESURE_DOWNLOAD<<%s\n%s\n%s\n' "$eof" "$download" "$eof"
+          } >> "$GITHUB_ENV"
         else
           echo "##vso[task.setvariable variable=PIPESURE]$bin"
           echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
         fi
         if [ -n "${GITHUB_OUTPUT:-}" ]; then
-          echo "download=$download" >> "$GITHUB_OUTPUT"
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          printf 'download<<%s\n%s\n%s\n' "$eof" "$download" "$eof" >> "$GITHUB_OUTPUT"
         fi
 
     - name: Read repository settings (read-only GitHub API)
@@ -153,6 +163,11 @@ runs:
         ROOT: ${{ inputs.path }}
       run: |
         set -uo pipefail
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+        if [ -z "${OUT:-}" ] || [ -z "${ROOT:-}" ] || ! no_ctl "$OUT" || ! no_ctl "$ROOT"; then
+          echo "pipesure: path and output inputs must be non-empty and must not contain control characters" >&2
+          exit 2
+        fi
         mkdir -p "$OUT/api"
         # The files checked in at the scanned commit, for PH-16's proof. No list, no proof.
         git -C "$ROOT" ls-tree -r --full-tree HEAD > "$OUT/api/files.txt" || rm -f "$OUT/api/files.txt"
@@ -230,5 +245,13 @@ runs:
         PIPESURE_LICENCE: ${{ inputs.licence }}
       run: |
         set -euo pipefail
-        echo "report=$OUT/report.json" >> "$GITHUB_OUTPUT"
+        no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+        if [ -z "${OUT:-}" ] || [ -z "${ROOT:-}" ] || ! no_ctl "$OUT" || ! no_ctl "$ROOT" || ! no_ctl "${FAIL_ON:-}"; then
+          echo "pipesure: action inputs must not contain control characters" >&2
+          exit 2
+        fi
+        if [ -n "${GITHUB_OUTPUT:-}" ]; then
+          eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+          printf 'report<<%s\n%s\n%s\n' "$eof" "$OUT/report.json" "$eof" >> "$GITHUB_OUTPUT"
+        fi
         "$PIPESURE" check --root "$ROOT" --out "$OUT" --fail-on "$FAIL_ON"

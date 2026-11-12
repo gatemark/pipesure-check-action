@@ -32,6 +32,11 @@ if [ "$PIPESURE_PUBLIC_KEY" = unpinned ] || [ "${#PIPESURE_PUBLIC_KEY}" -ne 43 ]
   exit 2
 fi
 case "$PIPESURE_SHOP" in https://*) ;; *) echo "pipesure: the shop address must be https" >&2; exit 2 ;; esac
+no_ctl() { local LC_ALL=C; case "$1" in *[[:cntrl:]]*) return 1 ;; esac; }
+if [ -z "${PIPESURE_TMP:-}" ] || ! no_ctl "$PIPESURE_TMP"; then
+  echo "pipesure: PIPESURE_TMP must be non-empty and must not contain control characters" >&2
+  exit 2
+fi
 tmp="$PIPESURE_TMP/pipesure-dl"
 mkdir -p "$tmp"
 bin="$tmp/pipesure"
@@ -85,11 +90,16 @@ case "$download" in *[!A-Za-z0-9_-]*|"") download=unknown ;; esac
 chmod +x "$bin"
 echo "pipesure: installed $PIPESURE_VERSION for $target, download $download (verified against the signed manifest)"
 if [ -n "${GITHUB_ENV:-}" ]; then
-  printf 'PIPESURE=%s\nPIPESURE_DOWNLOAD=%s\n' "$bin" "$download" >> "$GITHUB_ENV"
+  eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+  {
+    printf 'PIPESURE<<%s\n%s\n%s\n' "$eof" "$bin" "$eof"
+    printf 'PIPESURE_DOWNLOAD<<%s\n%s\n%s\n' "$eof" "$download" "$eof"
+  } >> "$GITHUB_ENV"
 else
   echo "##vso[task.setvariable variable=PIPESURE]$bin"
   echo "##vso[task.setvariable variable=PIPESURE_DOWNLOAD]$download"
 fi
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
-  echo "download=$download" >> "$GITHUB_OUTPUT"
+  eof="PIPESURE_EOF_$(openssl rand -hex 12)"
+  printf 'download<<%s\n%s\n%s\n' "$eof" "$download" "$eof" >> "$GITHUB_OUTPUT"
 fi
